@@ -1,0 +1,2 @@
+/* The schedule editor opens above the calendar, not as a bottom sheet. */
+.modal-backdrop:has(.editor){z-index:30;align-items:flex-start;padding-top:max(22px,env(safe-area-inset-top))}.modal-backdrop:has(.editor) .editor{margin:0 auto}.editor{box-shadow:0 18px 48px #061b353d}

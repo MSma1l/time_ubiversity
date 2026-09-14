@@ -1,0 +1,19 @@
+**/node_modules/
+**/dist/
+**/*.tsbuildinfo
+**/coverage/
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Local data and backups
+backend/data/
+backups/
+
+.DS_Store

@@ -1,0 +1,21 @@
+/* Scroll remains enabled; only the visual scrollbar chrome is suppressed. */
+.editor,
+.notification-panel,
+.calendar-panel,
+.catalog-panel,
+.catalog-panel .student-list,
+.existing-groups > div {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.editor::-webkit-scrollbar,
+.notification-panel::-webkit-scrollbar,
+.calendar-panel::-webkit-scrollbar,
+.catalog-panel::-webkit-scrollbar,
+.catalog-panel .student-list::-webkit-scrollbar,
+.existing-groups > div::-webkit-scrollbar {
+  display: none;
+  height: 0;
+  width: 0;
+}

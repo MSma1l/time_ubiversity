@@ -1,0 +1,29 @@
+# Orar Univer — host HTTPS reverse proxy (Caddy obtains/renews Let's Encrypt certs).
+#
+# Install on Ubuntu:  sudo apt install -y caddy
+# Use:                sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#                     (replace orar.example.md with your domain; keep 8083 = WEB_PORT)
+#                     sudo systemctl reload caddy
+# DNS A/AAAA record of the domain must point to the VPS; ports 80 and 443 open.
+
+orar.example.md {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8083 {
+		# Caddy sets X-Forwarded-For/-Proto/-Host; nginx trusts them from 127.0.0.1/private ranges.
+		health_uri /nginx-health
+		health_interval 30s
+	}
+
+	log {
+		output file /var/log/caddy/orar-access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}

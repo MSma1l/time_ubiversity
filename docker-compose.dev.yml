@@ -1,0 +1,11 @@
+# Local development override — NEVER use on the production VPS.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+# Exposes PostgreSQL and the API on localhost for debugging tools.
+services:
+  postgres:
+    ports:
+      # 5432 is often taken by another local project.
+      - "127.0.0.1:55434:5432"
+  api:
+    ports:
+      - "127.0.0.1:3001:3001"

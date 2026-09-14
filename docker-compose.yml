@@ -1,0 +1,109 @@
+# Orar Univer — production stack.
+#
+#   cp .env.example .env                  # compose-level secrets (POSTGRES_PASSWORD, WEB_PORT)
+#   cp backend/.env.example backend/.env  # app secrets (TELEGRAM_BOT_TOKEN, MINI_APP_URL, ...)
+#   ./deploy/deploy.sh                    # or: docker compose up -d --build
+#
+# Only `web` publishes a port, bound to 127.0.0.1 by default so a host HTTPS
+# proxy (deploy/Caddyfile) is the single public entry point.
+# Local development with DB/API ports: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+
+# No top-level `name:` on purpose: the project name stays the directory name so
+# volumes of an existing deployment (<dir>_orar-data, <dir>_postgres-data) are reused.
+# Pin it with COMPOSE_PROJECT_NAME in .env if you move the checkout.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-orar}
+      POSTGRES_USER: ${POSTGRES_USER:-orar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the root .env file (see .env.example)}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # No published ports: reachable only by `api` on the internal network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    logging: *default-logging
+
+  api:
+    build:
+      context: ./backend
+    image: orar-univer-api:latest
+    env_file:
+      - ./backend/.env
+    # Values here override backend/.env (container paths and internal hosts).
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      DATABASE_PATH: /data/orar.sqlite
+      DATABASE_URL: postgresql://${POSTGRES_USER:-orar}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the root .env file}@postgres:5432/${POSTGRES_DB:-orar}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - orar-data:/data
+    # No published ports: nginx (`web`) proxies /api/ and /telegram/ to api:3001.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    logging: *default-logging
+
+  web:
+    build:
+      context: ./frontend
+    image: orar-univer-web:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # Host HTTPS proxy -> 127.0.0.1:WEB_PORT. Set WEB_BIND=0.0.0.0 only if
+      # another trusted proxy/tunnel must reach it from outside the host.
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8083}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/nginx-health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    logging: *default-logging
+
+volumes:
+  orar-data:
+  postgres-data:
