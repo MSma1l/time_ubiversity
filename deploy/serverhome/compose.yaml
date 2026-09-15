@@ -1,0 +1,116 @@
+# Orar Univer on "serverhome": /srv/apps/time-university/compose.yaml
+#
+# docker-compose v1.29 (no `docker compose` v2, no buildx): no `build:`, no `profiles`,
+# no `deploy.resources` (mem_limit instead), no `ports:`. The images are built beforehand
+# from src/ with deploy/serverhome/build.sh (classic builder).
+#
+# One `.env` next to this file (chmod 600) feeds both the variable interpolation below and the
+# API's environment (env_file). Only the web container joins `shared-network` (nginx_proxy
+# reaches it as time-university-web:80); api and db stay on the project's `internal` network.
+#
+#   cd /srv/apps/time-university && docker-compose up -d
+
+x-hardened: &hardened
+  security_opt:
+    - 'no-new-privileges:true'
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: '10m'
+      max-file: '3'
+
+services:
+  # nginx: Mini App static files + /api/ and /telegram/ proxied to `api:3001` (frontend/nginx.conf).
+  # Named after its container: compose adds the service name as a DNS alias on every network,
+  # and a generic `web` on shared-network could collide with another app.
+  time-university-web:
+    <<: *hardened
+    image: time-university-web:prod
+    container_name: time-university-web
+    # The nginx master binds :80, creates its cache dirs and switches workers to `nginx`.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    mem_limit: 128m
+    expose:
+      - '80'
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - internal
+      - shared-network
+
+  # API (Node 22, uid 1000 `node`). The service MUST stay named `api`: the web container's
+  # nginx resolves http://api:3001 through Docker DNS on the internal network.
+  api:
+    <<: *hardened
+    image: time-university-api:prod
+    container_name: time-university-api
+    # No `init: true`: the image's ENTRYPOINT is already tini as PID 1 (a second init makes tini
+    # warn "not running as PID 1" and lose zombie reaping).
+    cap_drop:
+      - ALL
+    # Code and packages are read-only; only /data (SQLite, bind mount) and /tmp are writable.
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: 512m
+    env_file:
+      - .env
+    # Overrides .env: container paths and internal hosts.
+    environment:
+      NODE_ENV: 'production'
+      PORT: '3001'
+      HOST: '0.0.0.0'
+      DATABASE_PATH: '/data/orar.sqlite'
+      DATABASE_URL: 'postgresql://${POSTGRES_USER:-orar}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-orar}'
+    # ./data/sqlite must be owned by uid 1000 (deea) — deploy.sh creates it.
+    volumes:
+      - ./data/sqlite:/data
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    stop_grace_period: 20s
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+
+  # PostgreSQL 16 (Teacher Catalog). POSTGRES_PASSWORD is applied only when data/postgres is
+  # initialised. No cap_drop: the entrypoint chowns the bind mount to uid 70 and drops to it.
+  db:
+    <<: *hardened
+    image: postgres:16-alpine
+    container_name: time-university-db
+    mem_limit: 512m
+    environment:
+      POSTGRES_DB: '${POSTGRES_DB:-orar}'
+      POSTGRES_USER: '${POSTGRES_USER:-orar}'
+      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}'
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    stop_grace_period: 30s
+    networks:
+      - internal
+
+networks:
+  internal:
+  shared-network:
+    external: true
+    name: shared-network
