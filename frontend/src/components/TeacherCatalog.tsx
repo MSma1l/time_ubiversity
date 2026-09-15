@@ -1,9 +1,10 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import {
   createTeacherGroup, createTeacherStudent, deleteTeacherGroup, deleteTeacherStudent, errorMessage, loadAttendance, loadLabGrades, loadTeacherGroups, loadTeacherStudents,
   renameTeacherGroup, renameTeacherStudent, saveAttendance, saveLabGrade, type AttendanceStatus, type LabGrade, type TeacherGroup, type TeacherStudent,
 } from '../api'
 import { useDialog } from '../dialogs'
+import { lessonsLabel } from '../labels'
 import { formatDayMonth, universityClock } from '../schedule'
 import { confirmAction } from '../telegram'
 
@@ -18,6 +19,21 @@ const collator = new Intl.Collator('ro', { sensitivity: 'base', numeric: true })
 const sortGroups = (items: TeacherGroup[]) => [...items].sort((a, b) => collator.compare(a.name, b.name))
 const sortStudents = (items: TeacherStudent[]) => [...items].sort((a, b) => collator.compare(a.last_name, b.last_name) || collator.compare(a.first_name, b.first_name))
 const fullName = (student: TeacherStudent) => `${student.last_name} ${student.first_name}`
+const sameGroupName = (a: string, b: string) => a.trim().toLocaleLowerCase('ro') === b.trim().toLocaleLowerCase('ro')
+/** "PC · 2 ore în orar" / "Fără ore în orar"; null when the backend does not report the schedule link. */
+const scheduleLink = (group: TeacherGroup) => {
+  if (group.linkedLessons === undefined) return null
+  if (!group.linkedLessons) return { subjects: '', count: 'Fără ore în orar' }
+  return { subjects: group.subjects?.join(', ') ?? '', count: `${lessonsLabel(group.linkedLessons)} în orar` }
+}
+/** Subjects may be long and are truncated; the lesson count always stays visible. */
+function ScheduleLink({ group, className }: { group: TeacherGroup, className: string }) {
+  const link = scheduleLink(group)
+  if (!link) return null
+  return <small className={className} title={link.subjects ? `${link.subjects} · ${link.count}` : link.count}>
+    {link.subjects && <><span className="link-subjects">{link.subjects}</span><span className="link-sep" aria-hidden="true">·</span></>}<span className="link-count">{link.count}</span>
+  </small>
+}
 const formatGrade = (grade: number) => grade.toLocaleString('ro-RO', { maximumFractionDigits: 2 })
 
 /** Keeps a form's submit button visible above the mobile keyboard once the viewport has shrunk. */
@@ -26,11 +42,15 @@ const revealSubmit = (event: FormEvent<HTMLFormElement>) => {
   window.setTimeout(() => form.querySelector('[type=submit]')?.scrollIntoView({ block: 'nearest' }), 350)
 }
 
-type Props = { mode: 'settings' | 'records', available: boolean, onClose(): void }
+type Props = {
+  mode: 'settings' | 'records', available: boolean, onClose(): void
+  /** Opens on this group (matched case-insensitively), e.g. from a lesson card; groups created from lessons may need one re-fetch. */
+  initialGroupName?: string
+}
 type GradesState = { studentId: string, items: LabGrade[], loading: boolean, failed: boolean }
 type StudentDraft = { id: string, firstName: string, lastName: string }
 
-export function TeacherCatalog({ mode, available, onClose }: Props) {
+export function TeacherCatalog({ mode, available, onClose, initialGroupName }: Props) {
   const dialogRef = useDialog<HTMLElement>(onClose)
   const isSettings = mode === 'settings'
   const [today] = useState(() => universityClock().isoDate)
@@ -57,25 +77,45 @@ export function TeacherCatalog({ mode, available, onClose }: Props) {
   const [laboratory, setLaboratory] = useState('Laborator')
   const [grades, setGrades] = useState<GradesState | null>(null)
   const [gradeValue, setGradeValue] = useState('')
+  /** Group still to be selected after the groups load, and whether the list was already re-fetched for it. */
+  const pendingGroupRef = useRef(initialGroupName?.trim() ?? '')
+  const pendingRetriedRef = useRef(false)
 
   useEffect(() => {
     if (!available) return
     let active = true
+    let retrying = false
     loadTeacherGroups()
       .then((items) => {
         if (!active) return
+        const wanted = pendingGroupRef.current
+        const match = wanted ? items.find((item) => sameGroupName(item.name, wanted)) : undefined
+        // A group taken from a lesson is created by the server; if it is not listed yet, ask once more.
+        if (wanted && !match && !pendingRetriedRef.current) {
+          pendingRetriedRef.current = true
+          retrying = true
+          setGroupsReload((value) => value + 1)
+          return
+        }
+        pendingGroupRef.current = ''
         setGroups(sortGroups(items)); setGroupsFailed(false)
-        setSelected((current) => current && items.some((item) => item.id === current) ? current : sortGroups(items)[0]?.id ?? '')
-        setMessage('')
+        setSelected((current) => match ? match.id : current && items.some((item) => item.id === current) ? current : sortGroups(items)[0]?.id ?? '')
+        setMessage(wanted && !match ? `Grupa „${wanted}” nu este încă în catalog.${isSettings ? ' O poți crea acum mai jos.' : ''}` : '')
+        if (wanted && !match && isSettings) { setGroupName(wanted); setShowGroupForm(true) }
       })
       .catch((error) => {
         if (!active) return
         setGroupsFailed(true)
         setMessage(errorMessage(error, 'Catalogul nu este disponibil momentan. Încearcă din nou în câteva momente.'))
       })
-      .finally(() => { if (active) setGroupsLoading(false) })
+      .finally(() => { if (active && !retrying) setGroupsLoading(false) })
     return () => { active = false }
-  }, [available, groupsReload])
+  }, [available, groupsReload, isSettings])
+
+  // Keep the selected group chip visible in the horizontal list (e.g. opened from a lesson card).
+  useEffect(() => {
+    if (selected) dialogRef.current?.querySelector('.existing-groups button.selected')?.scrollIntoView({ block: 'nearest', inline: 'center' })
+  }, [selected, groups, dialogRef])
 
   useEffect(() => {
     if (!available || !selected) return
@@ -257,6 +297,7 @@ export function TeacherCatalog({ mode, available, onClose }: Props) {
         {isSettings && available && <button type="button" onClick={() => setShowGroupForm(true)}>＋ Creează grupă</button>}
         {available && !groupsLoading && groupsFailed && <button type="button" onClick={reloadGroups}>Reîncearcă</button>}
       </div>
+      {!isSettings && selectedGroup && scheduleLink(selectedGroup) && <p className="catalog-link-info"><span aria-hidden="true">🗓</span> <ScheduleLink group={selectedGroup} className="catalog-link" /></p>}
       {isSettings && groups.length > 0 && <section className="existing-groups" aria-label="Grupe existente">
         <header>
           <strong>Grupele mele</strong>
@@ -265,7 +306,7 @@ export function TeacherCatalog({ mode, available, onClose }: Props) {
             <button type="button" className="danger" onClick={removeGroup} disabled={busy}>Șterge</button>
           </span>}
         </header>
-        <div>{groups.map((item) => <button type="button" className={item.id === selected ? 'selected' : ''} aria-pressed={item.id === selected} key={item.id} onClick={() => selectGroup(item.id)}><span aria-hidden="true">👥</span>{item.name}<small>{item.student_count} stud.</small></button>)}</div>
+        <div>{groups.map((item) => <button type="button" className={item.id === selected ? 'selected' : ''} aria-pressed={item.id === selected} key={item.id} onClick={() => selectGroup(item.id)}><span aria-hidden="true">👥</span><span className="group-chip-text">{item.name}<ScheduleLink group={item} className="group-chip-link" /></span><small>{item.student_count} stud.</small></button>)}</div>
       </section>}
       {isSettings && selectedGroup && groupDraft !== null && <form className="catalog-form" onSubmit={renameGroup} onFocus={revealSubmit}>
         <strong>Redenumește grupa {selectedGroup.name}</strong>

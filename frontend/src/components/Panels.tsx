@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useDialog } from '../dialogs'
-import { formatServerDate, formatWeekRange, lessonMatchesWeek, teachingDays, timeToMinutes, weekdayNames, weekTypeFor, weekTypeLabels } from '../schedule'
-import { initialOf, roleLabels } from '../labels'
+import { addDays, formatServerDate, formatWeekRange, lessonMatchesWeek, lessonTiming, teachingDays, timeToMinutes, weekdayNames, weekTypeFor, weekTypeLabels, type UniversityClock } from '../schedule'
+import { initialOf, roleLabels, timingText } from '../labels'
+import { CheckIcon } from './LessonCard'
 import type { AppNotification, Lesson, Role, WeekType } from '../types'
 
 export function NotificationPanel({ items, onClose }: { items: AppNotification[], onClose(): void }) {
@@ -52,10 +53,12 @@ export function WeekNav({ start, offset, onShift, onReset, resetVisible = offset
 
 type CalendarProps = {
   lessons: Lesson[], role: Role, weekStart: string, weekOffset: number,
+  /** University clock: lessons of the displayed week are marked past / current. */
+  clock: UniversityClock,
   onShiftWeek(delta: number): void, onResetWeek(): void, onClose(): void, onAdd(day: number, time: string): void, onEdit(lesson: Lesson): void,
 }
 
-export function CalendarPanel({ lessons, role, weekStart, weekOffset, onShiftWeek, onResetWeek, onClose, onAdd, onEdit }: CalendarProps) {
+export function CalendarPanel({ lessons, role, clock, weekStart, weekOffset, onShiftWeek, onResetWeek, onClose, onAdd, onEdit }: CalendarProps) {
   const dialogRef = useDialog<HTMLElement>(onClose)
   /** Off: only the displayed week's lessons. On: every lesson of the role; the other parity is dimmed but still editable. */
   const [showAll, setShowAll] = useState(false)
@@ -100,8 +103,13 @@ export function CalendarPanel({ lessons, role, weekStart, weekOffset, onShiftWee
             return <div className="calendar-cell occupied" key={`${day}-${time}`}>
               {items.map((item) => {
                 const inWeek = lessonMatchesWeek(item, week)
-                return <button type="button" key={item.id} className={`calendar-lesson ${inWeek ? '' : 'other-week'}`} onClick={() => onEdit(item)}
-                  aria-label={`Editează ${item.title}, ${dayName} ${item.startTime}, ${shortWeek[item.weekType]}${inWeek ? '' : ' (nu în această săptămână)'}`}>
+                // Only lessons that take place in the displayed week have a time state.
+                const timing = inWeek ? lessonTiming(item, addDays(weekStart, day), clock) : undefined
+                const state = timing?.state === 'past' || timing?.state === 'current' ? timing.state : ''
+                const spoken = state ? `, ${timingText(timing)?.spoken}` : ''
+                return <button type="button" key={item.id} className={['calendar-lesson', inWeek ? '' : 'other-week', state].filter(Boolean).join(' ')} onClick={() => onEdit(item)}
+                  aria-label={`Editează ${item.title}, ${dayName} ${item.startTime}, ${shortWeek[item.weekType]}${inWeek ? '' : ' (nu în această săptămână)'}${spoken}`}>
+                  {state === 'past' && <CheckIcon />}{state === 'current' && <i className="live-dot" aria-hidden="true" />}
                   <b>{item.title}</b><small>{item.startTime !== time ? `${item.startTime} · ` : ''}{item.room}</small><em>{shortWeek[item.weekType]}</em>
                 </button>
               })}

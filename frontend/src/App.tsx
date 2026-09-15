@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ApiError, deleteLessonRemote, devTelegramId, errorMessage, loadAccount, loadNotifications, markNotificationsRead, saveLessonRemote, updateLessonRemote, updateProfileState, updateRole } from './api'
+import { ApiError, deleteLessonRemote, devTelegramId, errorMessage, loadAccount, loadNotifications, loadTeacherGroups, markNotificationsRead, saveLessonRemote, updateLessonRemote, updateProfileState, updateRole } from './api'
 import { BellIcon, LessonCard } from './components/LessonCard'
 import { LessonEditor, type EditorFailure } from './components/LessonEditor'
 import { CalendarPanel, NotificationPanel, ProfilePanel, WeekNav } from './components/Panels'
 import { TeacherCatalog } from './components/TeacherCatalog'
 import { initialOf, minutesLabel, roleLabels } from './labels'
-import { addDays, byStartTime, currentInstant, dayOfMonth, demoLessons, formatDayMonth, formatWeekRange, lessonMatchesWeek, mondayOf, timeToMinutes, universityClock, weekdayNames, weekTypeFor, weekTypeLabels } from './schedule'
+import { addDays, byStartTime, currentInstant, dayOfMonth, demoLessons, formatDayMonth, formatWeekRange, lessonMatchesWeek, lessonTiming, mondayOf, timeToMinutes, universityClock, weekdayNames, weekTypeFor, weekTypeLabels } from './schedule'
 import { confirmAction, detectSession } from './telegram'
 import type { AccountProfile } from './api'
 import type { AppNotification, Lesson, Role } from './types'
@@ -79,6 +79,12 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   const [profileOpen, setProfileOpen] = useState(false)
   const [catalogOpen, setCatalogOpen] = useState(false)
   const [groupSettingsOpen, setGroupSettingsOpen] = useState(false)
+  /** Group the catalog opens on (from a teacher lesson card); null opens the first group. */
+  const [catalogGroup, setCatalogGroup] = useState<string | null>(null)
+  /** Group names from the Teacher Catalog, offered as suggestions in the lesson editor. */
+  const [catalogGroupNames, setCatalogGroupNames] = useState<string[]>([])
+  /** Catalog groups may have changed (teacher lesson saved, catalog edited): re-fetch them before they are needed again. */
+  const catalogGroupsStaleRef = useRef(true)
   const lastDateRef = useRef(today.isoDate)
   /** Profile PATCH requests are serialised: a second tap while one is pending is ignored. */
   const profileBusyRef = useRef(false)
@@ -88,15 +94,18 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   const success = (text: string) => setNotice({ kind: 'success', text })
   const failure = (text: string) => setNotice({ kind: 'error', text })
 
-  // Keep "now" fresh; when the university date changes, jump to the new day.
+  // Keep "now" fresh (lesson states depend on it), also right after the app becomes visible again; when the university date changes, jump to the new day.
   useEffect(() => {
-    const timer = window.setInterval(() => {
+    const tick = () => {
       const current = currentInstant()
       const clock = universityClock(current)
       if (clock.isoDate !== lastDateRef.current) { lastDateRef.current = clock.isoDate; setActiveDay(clock.weekdayIndex); setWeekOffset(0) }
       setNow(current)
-    }, CLOCK_TICK_MS)
-    return () => window.clearInterval(timer)
+    }
+    const onVisibility = () => { if (document.visibilityState === 'visible') tick() }
+    const timer = window.setInterval(tick, CLOCK_TICK_MS)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', onVisibility) }
   }, [])
 
   useEffect(() => {
@@ -188,6 +197,8 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
     if (blocked) return { message: blocked, fields: [] }
     try {
       const saved = synced ? await (isNew ? saveLessonRemote(lesson) : updateLessonRemote(lesson)) : lesson
+      // The backend adds the group of a teacher lesson to the catalog.
+      if (saved.role === 'teacher' && saved.group) catalogGroupsStaleRef.current = true
       setLessons((items) => isNew ? [...items, saved] : items.map((item) => item.id === lesson.id ? saved : item))
       setEditor(null)
       // Show the day of the saved lesson; when its parity hides it in the displayed week, move to the next week, where it appears.
@@ -219,8 +230,29 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
     }
   }
 
-  const openNewLesson = (day = activeDay, time = '08:00') => setEditor({ lesson: null, slot: { day: Math.min(day, weekdayNames.length - 1), time }, role })
-  const openLesson = (lesson: Lesson) => setEditor({ lesson, slot: null, role: lesson.role })
+  /** Best effort: without the catalog (e.g. no PostgreSQL) the editor still suggests the groups of the teacher's own lessons. */
+  const refreshCatalogGroupNames = () => {
+    if (!synced || !catalogGroupsStaleRef.current) return
+    catalogGroupsStaleRef.current = false
+    loadTeacherGroups()
+      .then((items) => setCatalogGroupNames(items.map((item) => item.name)))
+      .catch(() => { catalogGroupsStaleRef.current = true })
+  }
+  const openEditor = (state: NonNullable<typeof editor>) => {
+    if (state.role === 'teacher') refreshCatalogGroupNames()
+    setEditor(state)
+  }
+  const openNewLesson = (day = activeDay, time = '08:00') => openEditor({ lesson: null, slot: { day: Math.min(day, weekdayNames.length - 1), time }, role })
+  const openLesson = (lesson: Lesson) => openEditor({ lesson, slot: null, role: lesson.role })
+  const openGroupStudents = (group: string) => { setCatalogGroup(group); setGroupSettingsOpen(true) }
+  const closeCatalog = () => { catalogGroupsStaleRef.current = true; setCatalogOpen(false); setGroupSettingsOpen(false); setCatalogGroup(null) }
+  const groupSuggestions = useMemo(() => {
+    const seen = new Set<string>()
+    return [...catalogGroupNames, ...lessons.filter((item) => item.role === 'teacher').map((item) => item.group)]
+      .map((name) => name.trim())
+      .filter((name) => { const key = name.toLocaleLowerCase('ro'); if (!name || seen.has(key)) return false; seen.add(key); return true })
+      .sort((a, b) => a.localeCompare(b, 'ro', { numeric: true }))
+  }, [catalogGroupNames, lessons])
 
   /** Applies the fields returned by PATCH /api/me (the server is the source of truth). */
   const applyServerProfile = (profile: Partial<Pick<AccountProfile, 'role' | 'studentEnabled' | 'teacherEnabled'>>, fallback: RoleState) => {
@@ -340,6 +372,9 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   const dateForDay = (dayIndex: number) => addDays(weekStart, dayIndex)
   const unreadCount = roleNotifications.filter((item) => !item.readAt).length
   const isToday = weekOffset === 0 && activeDay === today.weekdayIndex
+  const displayedDate = dateForDay(activeDay)
+  const timings = displayedLessons.map((lesson) => lessonTiming(lesson, displayedDate, today))
+  const doneForToday = isToday && timings.length > 0 && timings.every((timing) => timing.state === 'past')
 
   return <main className="app-shell">
     <header className="topbar">
@@ -386,7 +421,8 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
       {syncState === 'error' ? <div className="empty" role="alert">
         <span aria-hidden="true">⚠️</span><h3>Orarul nu a putut fi încărcat</h3><p>{loadError}</p><button type="button" onClick={retryLoad}>Reîncearcă</button>
       </div> : syncState === 'loading' ? null : displayedLessons.length ? <div className="timeline">
-        {displayedLessons.map((lesson) => <LessonCard key={lesson.id} lesson={lesson} role={role} onEdit={() => openLesson(lesson)} />)}
+        {displayedLessons.map((lesson, index) => <LessonCard key={lesson.id} lesson={lesson} role={role} timing={timings[index]} onEdit={() => openLesson(lesson)} onOpenGroup={role === 'teacher' ? openGroupStudents : undefined} />)}
+        {doneForToday && <p className="day-done">Gata pe azi <span aria-hidden="true">🎉</span>{nextLesson ? <> Următoarea oră: <b>{nextLesson.lesson.title}</b> · {nextLesson.label} {nextLesson.lesson.startTime}</> : ' Nu mai ai alte ore planificate.'}</p>}
       </div> : <div className="empty free-day">
         <span aria-hidden="true">☀️</span><h3>{isToday ? 'Ești liber azi' : 'Zi liberă'}</h3><p>Nu ai nicio pereche în această zi. Bucură-te de timp liber!</p><button type="button" onClick={() => openNewLesson()}>Adaugă o activitate</button>
       </div>}
@@ -406,14 +442,14 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
       <button type="button" className="nav-item" onClick={() => setProfileOpen(true)}><span aria-hidden="true">◌</span><small>Profil</small></button>
     </footer>
 
-    {calendarOpen && <CalendarPanel lessons={lessons} role={role} weekStart={weekStart} weekOffset={weekOffset} onShiftWeek={shiftWeek} onResetWeek={() => setWeekOffset(0)}
+    {calendarOpen && <CalendarPanel lessons={lessons} role={role} clock={today} weekStart={weekStart} weekOffset={weekOffset} onShiftWeek={shiftWeek} onResetWeek={() => setWeekOffset(0)}
       onClose={() => setCalendarOpen(false)} onAdd={openNewLesson} onEdit={(lesson) => { setCalendarOpen(false); openLesson(lesson) }} />}
     {editor && <LessonEditor key={editor.lesson?.id ?? 'new'} role={editor.role} existing={editor.lesson} slot={editor.slot} onClose={() => setEditor(null)}
-      onSave={(lesson) => saveLesson(lesson, !editor.lesson)} onDelete={editor.lesson ? () => removeLesson(editor.lesson as Lesson) : undefined} />}
+      groupSuggestions={editor.role === 'teacher' ? groupSuggestions : undefined} onSave={(lesson) => saveLesson(lesson, !editor.lesson)} onDelete={editor.lesson ? () => removeLesson(editor.lesson as Lesson) : undefined} />}
     {notificationsOpen && <NotificationPanel items={roleNotifications} onClose={() => setNotificationsOpen(false)} />}
     {profileOpen && <ProfilePanel name={name} role={role} week={week} enabled={roleEnabled} synced={synced} error={notice?.kind === 'error' ? notice.text : ''} onClose={() => setProfileOpen(false)}
       onSwitchRole={() => chooseRole(otherRole(role))} onToggle={toggleRoleEnabled} onOpenGroupSettings={() => { setProfileOpen(false); setGroupSettingsOpen(true) }} />}
-    {groupSettingsOpen && <TeacherCatalog mode="settings" available={synced} onClose={() => setGroupSettingsOpen(false)} />}
-    {catalogOpen && <TeacherCatalog mode="records" available={synced} onClose={() => setCatalogOpen(false)} />}
+    {groupSettingsOpen && <TeacherCatalog mode="settings" available={synced} initialGroupName={catalogGroup ?? undefined} onClose={closeCatalog} />}
+    {catalogOpen && <TeacherCatalog mode="records" available={synced} onClose={closeCatalog} />}
   </main>
 }

@@ -5,3 +5,48 @@
 .day-tabs .today b{text-decoration:underline;text-decoration-color:#e8b83e;text-decoration-thickness:2px;text-underline-offset:3px}
 .week-hint{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;margin-top:10px;border:1px dashed #c9d6e4;border-radius:12px;padding:9px 12px;background:#f7f9fc;color:#4f6580;font-size:11px;font-weight:600;text-align:left}.week-hint span{color:#174e86;font-size:16px}
 .profile-error{margin:12px 0 0}
+/* Lesson time states (past / current / upcoming) */
+.lesson{--tone:#e4ae30;position:relative;transition:opacity .2s,box-shadow .2s}
+.lesson.violet{--tone:#1d6aa9}
+.lesson.blue{--tone:#0f457d}
+.lesson-meta{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px}
+.lesson-info .lesson-state{display:inline-flex;align-items:center;gap:4px;border-radius:999px;padding:2px 7px;font-size:10px;font-weight:700;line-height:1.4;white-space:nowrap}
+.lesson-state.past{background:#eef1f5;color:#66768a}
+.lesson-state.current{background:#e5f6ec;color:#17693c}
+.lesson-state.upcoming{background:#fdf4df;color:#8a5f06}
+.check-icon{width:11px;height:11px;flex:none;fill:none;stroke:currentColor;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.live-dot{width:6px;height:6px;flex:none;border-radius:50%;background:#1f9d55;box-shadow:0 0 0 0 #1f9d5566;animation:live-pulse 1.8s ease-out infinite}
+@keyframes live-pulse{70%{box-shadow:0 0 0 5px #1f9d5500}100%{box-shadow:0 0 0 0 #1f9d5500}}
+.lesson.past{background:#f6f8fa;border-color:#e6ebf0;border-left-color:#c3ccd6;box-shadow:none}
+.lesson.past time,.lesson.past h3,.lesson.past .lesson-meta>span,.lesson.past p{opacity:.62}
+.lesson.past h3{color:#4f5f72}
+.lesson.current{border-color:var(--tone);border-left-width:4px;box-shadow:0 0 0 3px #e4ae3033,0 6px 18px #17293f14;box-shadow:0 0 0 3px color-mix(in srgb,var(--tone) 18%,transparent),0 6px 18px #17293f14;padding-bottom:18px}
+.lesson-progress{position:absolute;left:14px;right:14px;bottom:8px;height:3px;border-radius:3px;background:#e8edf3;overflow:hidden}
+.lesson-progress i{display:block;height:100%;border-radius:inherit;background:var(--tone);transition:width .6s}
+.lesson .group-link{display:inline-flex;align-items:center;gap:4px;max-width:100%;margin-top:7px;border:1px solid #cbddeb;border-radius:999px;padding:4px 9px;background:#f4f9fd;color:#174e86;font:inherit;font-size:11px;cursor:pointer}
+.lesson .group-link b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lesson .group-link small{color:#5b7590;font-size:10px;white-space:nowrap}
+.lesson .group-link:active{background:#e3f0fa}
+.day-done{margin:2px 0 0;padding:10px 12px;border-radius:12px;background:#f1f8f3;border:1px solid #d6ebdd;color:#3d5a48;font-size:12px;line-height:1.45}
+.day-done b{color:#1f4a31}
+@media (prefers-reduced-motion:reduce){.live-dot{animation:none}.lesson,.lesson-progress i{transition:none}}
+/* Lesson editor: group suggestions from the Teacher Catalog */
+.group-suggestions{display:flex;align-items:center;gap:6px;overflow-x:auto;margin:-4px 0 4px;padding:2px 0 4px}
+.group-suggestions small{flex:none;color:#718094;font-size:11px;font-weight:600}
+.group-suggestions button{flex:none;display:inline-flex;gap:4px;border:1px solid #cbddeb;border-radius:999px;padding:5px 10px;background:#f4f9fd;color:#174e86;font:inherit;font-size:12px;font-weight:600}
+/* Calendar: past / current lessons of the displayed week */
+.calendar-lesson.past{background:#f3f5f8;border-left-color:#b9c4d0;color:#7b8a9b}
+.calendar-lesson.past b,.calendar-lesson.past small{opacity:.7}
+.calendar-lesson.current{background:#e5f6ec;border-left-color:#1f9d55;box-shadow:0 0 0 2px #1f9d5540}
+.calendar-lesson .check-icon,.calendar-lesson .live-dot{position:absolute;top:4px;right:4px}
+.calendar-lesson .check-icon{width:10px;height:10px;color:#7b8a9b}
+.calendar-lesson.past b,.calendar-lesson.current b{padding-right:9px}
+/* Catalog: link between groups and the teacher schedule */
+.group-chip-text{display:flex;flex-direction:column;align-items:flex-start;gap:1px;text-align:left}
+.existing-groups .group-chip-link,.catalog-link{display:flex;min-width:0;max-width:190px;white-space:nowrap;color:#5b7590;font-size:10px}
+.group-chip-link .link-subjects,.catalog-link .link-subjects{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.link-count,.link-sep{flex:none}
+.link-sep{padding:0 4px}
+.catalog-link{display:inline-flex;max-width:calc(100% - 24px);vertical-align:bottom;font-size:12px;color:inherit}
+.catalog-link-info{margin:8px 0 0;color:#4f6580;font-size:12px}
+.lesson .group-link span{font-size:12px;color:inherit;font-weight:400}

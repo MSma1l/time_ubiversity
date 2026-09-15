@@ -6,7 +6,8 @@ import { ZodError } from "zod";
 import { academicDatabase, academicHealth, ensureAcademicSchema, isConnectionError, resetAcademicSchema } from "./academic.js";
 import { handleBotMessage, webhookSecret } from "./bot.js";
 import type { AppConfig } from "./config.js";
-import { addNotification, lessonById, lessonRows, upsertProfile, type SqliteDatabase } from "./db.js";
+import { addNotification, lessonById, lessonRows, upsertProfile, type Lesson, type SqliteDatabase } from "./db.js";
+import { backfillOwnerGroups, ownerLessonLinks, syncLessonGroup, withLessonLinks } from "./groupSync.js";
 import { ProfileRuleError, readProfile, updateProfile } from "./profile.js";
 import { createRateLimiter, rateLimitMiddleware } from "./rateLimit.js";
 import { isoDateInChisinau, isValidIsoDate, SEMESTER_REFERENCE_KIND, SEMESTER_REFERENCE_MONDAY, universityWeekKind, universityWeekNumber } from "./schedule.js";
@@ -105,13 +106,27 @@ export function createApp({ db, config, log = console }: AppDependencies) {
 
   const roleLabel = (role: string) => role === "teacher" ? "Profesor" : "Student";
 
+  /**
+   * After a teacher lesson is saved (SQLite already committed), make sure its group exists in the Teacher
+   * Catalog. Timing: awaited for at most GROUP_SYNC_WAIT_MS so the group is usually visible right away;
+   * a slower sync keeps running in the background. It never fails the lesson request (see groupSync.ts).
+   */
+  const GROUP_SYNC_WAIT_MS = 1_500;
+  const syncGroupOf = async (ownerId: number, lesson: Lesson | undefined) => {
+    if (!lesson || lesson.role !== "teacher" || !lesson.groupName?.trim() || !config.databaseUrl) return;
+    const task = syncLessonGroup(config.databaseUrl, ownerId, lesson, LIMITS.groupsPerTeacher, log);
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([task, new Promise<void>((resolve) => { timer = setTimeout(resolve, GROUP_SYNC_WAIT_MS); timer.unref(); })]);
+    clearTimeout(timer);
+  };
+
   // Student and Profesor schedules are two separate lists of the same user, told apart by `role`.
   app.get("/api/lessons", auth, (req, res) => {
     const role = req.query.role;
     if (role !== undefined && role !== "student" && role !== "teacher") return res.status(400).json({ error: "Rolul trebuie să fie student sau teacher" });
     res.json(lessonRows(db, userOf(req).id, role));
   });
-  app.post("/api/lessons", auth, (req, res) => {
+  app.post("/api/lessons", auth, async (req, res) => {
     const input = lessonSchema.parse(req.body); const ownerId = userOf(req).id;
     const count = (db.prepare("SELECT COUNT(*) AS count FROM lessons WHERE owner_id=?").get(ownerId) as { count: number }).count;
     if (count >= LIMITS.lessonsPerUser) throw new HttpError(409, `Ai atins limita de ${LIMITS.lessonsPerUser} ore în orar.`);
@@ -121,15 +136,18 @@ export function createApp({ db, config, log = console }: AppDependencies) {
       addNotification(db, ownerId, "system", "Orar actualizat", `Ai adăugat în orarul de ${roleLabel(input.role)}: ${input.title}, ${input.startTime}–${input.endTime}.`, input.role);
       return lessonById(db, ownerId, result.lastInsertRowid);
     })();
+    await syncGroupOf(ownerId, created);
     res.status(201).json(created);
   });
-  app.put("/api/lessons/:id", auth, (req, res) => {
+  app.put("/api/lessons/:id", auth, async (req, res) => {
     const id = lessonIdSchema.parse(req.params.id); const input = lessonUpdateSchema.parse(req.body); const ownerId = userOf(req).id;
     // A missing role keeps the lesson in the schedule it already belongs to.
     const result = db.prepare(`UPDATE lessons SET role=COALESCE(@role, role),title=@title,group_name=@groupName,teacher_name=@teacherName,room=@room,weekday=@weekday,start_time=@startTime,end_time=@endTime,week_kind=@weekKind,reminder_minutes=@reminderMinutes,notifications_enabled=@notificationsEnabled,updated_at=CURRENT_TIMESTAMP WHERE id=@id AND owner_id=@ownerId`)
       .run({ ...input, role: input.role ?? null, id, ownerId, notificationsEnabled: Number(input.notificationsEnabled) });
     if (!result.changes) return res.status(404).json({ error: "Ora nu a fost găsită" });
-    res.json(lessonById(db, ownerId, id));
+    const updated = lessonById(db, ownerId, id);
+    await syncGroupOf(ownerId, updated);
+    res.json(updated);
   });
   app.delete("/api/lessons/:id", auth, (req, res) => {
     const id = lessonIdSchema.parse(req.params.id); const ownerId = userOf(req).id;
@@ -184,11 +202,25 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   const GROUP_COLUMNS = "g.id, g.owner_id, g.name, g.subject, g.created_at, (SELECT COUNT(*)::int FROM students s WHERE s.group_id=g.id) AS student_count";
   const GRADE_COLUMNS = "id, student_id, laboratory, presented_on::text AS presented_on, grade::float8 AS grade, feedback, created_at";
 
+  /**
+   * Groups linked to the Profesor schedule: `linkedLessons` / `subjects` come from the owner's teacher lessons
+   * whose group name matches (trimmed, case-insensitive). Links are computed, never stored: renaming a group
+   * does not change lessons and deleting a group does not delete lessons.
+   */
   app.get("/api/teacher/groups", auth, async (req, res) => {
+    const ownerId = userOf(req).id;
     const pg = await catalog(res); if (!pg) return;
+    // First visit: import the groups of lessons created before the catalog link existed (once per owner).
+    try {
+      await backfillOwnerGroups(db, pg, ownerId, LIMITS.groupsPerTeacher, log);
+    } catch (error) {
+      if (isConnectionError(error)) throw error;
+      log.warn(`Catalog group backfill failed for owner ${ownerId}:`, error instanceof Error ? error.message : error);
+    }
     // Display order (Romanian collation) is applied by the client; the server order is only a stable default.
-    const result = await pg.query(`SELECT ${GROUP_COLUMNS} FROM academic_groups g WHERE g.owner_id=$1 ORDER BY lower(g.name), g.name`, [userOf(req).id]);
-    res.json(result.rows);
+    const result = await pg.query(`SELECT ${GROUP_COLUMNS} FROM academic_groups g WHERE g.owner_id=$1 ORDER BY lower(g.name), g.name`, [ownerId]);
+    const links = ownerLessonLinks(db, ownerId);
+    res.json(result.rows.map((group) => withLessonLinks(group, links)));
   });
   app.post("/api/teacher/groups", auth, async (req, res) => {
     const input = groupSchema.parse(req.body); const ownerId = userOf(req).id;
@@ -197,8 +229,9 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     if (count >= LIMITS.groupsPerTeacher) throw new HttpError(409, `Ai atins limita de ${LIMITS.groupsPerTeacher} grupe.`);
     await assertGroupNameFree(pg, ownerId, input.name);
     const result = await pg.query("INSERT INTO academic_groups(owner_id,name,subject) VALUES($1,$2,$3) RETURNING id, owner_id, name, subject, created_at, 0 AS student_count", [ownerId, input.name, input.subject]);
-    res.status(201).json(result.rows[0]);
+    res.status(201).json(withLessonLinks(result.rows[0], ownerLessonLinks(db, ownerId)));
   });
+  /** Renaming only changes the catalog; lessons keep their group name (the link follows the name). */
   app.patch("/api/teacher/groups/:groupId", auth, async (req, res) => {
     const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND); const input = groupPatchSchema.parse(req.body); const ownerId = userOf(req).id;
     const pg = await catalog(res); if (!pg) return;
@@ -208,9 +241,9 @@ export function createApp({ db, config, log = console }: AppDependencies) {
       [groupId, ownerId, input.name ?? null, input.subject !== undefined, input.subject ?? null]);
     const result = await pg.query(`SELECT ${GROUP_COLUMNS} FROM academic_groups g WHERE g.id=$1 AND g.owner_id=$2`, [groupId, ownerId]);
     if (!result.rowCount) return res.status(404).json({ error: GROUP_NOT_FOUND });
-    res.json(result.rows[0]);
+    res.json(withLessonLinks(result.rows[0], ownerLessonLinks(db, ownerId)));
   });
-  /** Deletes the group with its students, attendance and grades (ON DELETE CASCADE). */
+  /** Deletes the group with its students, attendance and grades (ON DELETE CASCADE). Lessons are never deleted. */
   app.delete("/api/teacher/groups/:groupId", auth, async (req, res) => {
     const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND);
     const pg = await catalog(res); if (!pg) return;

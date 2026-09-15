@@ -2,10 +2,11 @@ import "dotenv/config";
 import type { Server } from "node:http";
 import cron from "node-cron";
 import { closeAcademicDatabase, initAcademicWithRetry } from "./academic.js";
-import { createApp } from "./app.js";
+import { createApp, LIMITS } from "./app.js";
 import { configureWebhook, registerBotCommands, startPolling } from "./bot.js";
 import { ConfigError, loadConfig, miniAppButton, type AppConfig } from "./config.js";
 import { openDatabase, pruneDatabase, type SqliteDatabase } from "./db.js";
+import { backfillAllCatalogGroups } from "./groupSync.js";
 import { sendDueReminders } from "./reminders.js";
 import { isoDateInChisinau, UNIVERSITY_TIMEZONE } from "./schedule.js";
 import { telegramApi } from "./telegram.js";
@@ -32,7 +33,10 @@ if (config.miniAppUrl && !config.miniAppUrl.startsWith("https://")) console.warn
 if (config.token && !config.polling && !config.webhookUrl) console.warn("Neither TELEGRAM_POLLING=true nor WEBHOOK_URL is set: the bot will not receive commands");
 
 const lifecycle = new AbortController();
-void initAcademicWithRetry(config.databaseUrl, lifecycle.signal);
+// Non-blocking: once PostgreSQL is ready, import the groups of existing teacher lessons (once per owner).
+void initAcademicWithRetry(config.databaseUrl, lifecycle.signal)
+  .then(() => backfillAllCatalogGroups(db, config.databaseUrl, LIMITS.groupsPerTeacher, lifecycle.signal))
+  .catch((error) => console.error("Catalog group backfill failed:", error));
 
 const app = createApp({ db, config });
 const server: Server = app.listen(config.port, config.host, () => console.log(`Orar API listens on ${config.host}:${config.port}`));

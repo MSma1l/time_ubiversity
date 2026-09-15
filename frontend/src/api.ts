@@ -157,11 +157,26 @@ export const loadNotifications = () => request<AppNotification[]>('/api/notifica
 /** Marks as read the notifications of one schedule plus the general ones. */
 export const markNotificationsRead = (role: Role) => request<void>('/api/notifications/read', { method: 'PATCH', body: JSON.stringify({ role }) })
 
-export type TeacherGroup = { id: string, name: string, subject?: string | null, student_count: number }
+export type TeacherGroup = {
+  id: string, name: string, subject?: string | null, student_count: number
+  /** Teacher lessons with the same group name (case-insensitive); absent on backends without the schedule link. */
+  linkedLessons?: number
+  /** Distinct lesson titles of those lessons. */
+  subjects?: string[]
+}
+type ApiTeacherGroup = Omit<TeacherGroup, 'linkedLessons' | 'subjects' | 'student_count'> & { student_count?: number | string, linkedLessons?: number | string, linked_lessons?: number | string, subjects?: unknown }
+/** PostgreSQL counts may arrive as strings; the schedule-link fields are optional. */
+const fromApiGroup = ({ linked_lessons: linkedSnake, linkedLessons: linkedCamel, subjects, student_count: studentCount, ...group }: ApiTeacherGroup): TeacherGroup => {
+  const result: TeacherGroup = { ...group, student_count: Number(studentCount) || 0 }
+  const linked = Number(linkedCamel ?? linkedSnake)
+  if ((linkedCamel ?? linkedSnake) !== undefined && Number.isFinite(linked)) result.linkedLessons = linked
+  if (Array.isArray(subjects)) result.subjects = subjects.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+  return result
+}
 export type TeacherStudent = { id: string, first_name: string, last_name: string }
 export type AttendanceStatus = 'present' | 'absent' | 'late'
 
-export const loadTeacherGroups = () => request<TeacherGroup[]>('/api/teacher/groups')
+export const loadTeacherGroups = async () => (await request<ApiTeacherGroup[]>('/api/teacher/groups')).map(fromApiGroup)
 export const createTeacherGroup = (name: string, subject: string) =>
   request<TeacherGroup>('/api/teacher/groups', { method: 'POST', body: JSON.stringify({ name: name.trim(), subject: subject.trim() || undefined }) })
 export const loadTeacherStudents = (groupId: string) => request<TeacherStudent[]>(`/api/teacher/groups/${encodeURIComponent(groupId)}/students`)

@@ -128,3 +128,28 @@ export function formatServerDate(value: string) {
   const date = parseServerDate(value)
   return date ? date.toLocaleString('ro-RO', { timeZone: UNIVERSITY_TIME_ZONE, dateStyle: 'medium', timeStyle: 'short' }) : ''
 }
+
+export type LessonTimeState = 'past' | 'current' | 'upcoming'
+export type LessonTiming = {
+  state: LessonTimeState
+  /** Current lesson: whole minutes until it ends (at least 1). */
+  minutesLeft?: number
+  /** Current lesson: elapsed share, 0–1. */
+  progress?: number
+  /** Upcoming lesson today: minutes until it starts. */
+  startsIn?: number
+}
+
+/** Where a lesson held on `isoDate` stands relative to the university clock: earlier days are over, later days are ahead. */
+export function lessonTiming(lesson: Pick<Lesson, 'startTime' | 'endTime'>, isoDate: string, clock: UniversityClock): LessonTiming {
+  if (isoDate < clock.isoDate) return { state: 'past' }
+  if (isoDate > clock.isoDate) return { state: 'upcoming' }
+  const start = timeToMinutes(lesson.startTime)
+  const end = timeToMinutes(lesson.endTime)
+  if (end <= clock.minutes) return { state: 'past' }
+  if (start <= clock.minutes) {
+    const duration = Math.max(end - start, 1)
+    return { state: 'current', minutesLeft: Math.max(end - clock.minutes, 1), progress: Math.min(Math.max((clock.minutes - start) / duration, 0), 1) }
+  }
+  return { state: 'upcoming', startsIn: start - clock.minutes }
+}

@@ -23,6 +23,8 @@ type Props = {
   /** Resolves to null when the lesson was saved (the parent closes the editor), otherwise to the reason. */
   onSave(lesson: Lesson): Promise<EditorFailure | null>
   onDelete?(): Promise<EditorFailure | null>
+  /** Teacher schedule: group names from the catalog, offered while typing (the group stays optional). */
+  groupSuggestions?: string[]
 }
 
 /** Backend field names (lessonSchema) that have a control in this form. */
@@ -30,9 +32,11 @@ type FieldName = 'title' | 'groupName' | 'teacherName' | 'room' | 'weekday' | 'w
 type FieldErrors = Partial<Record<FieldName, string>>
 const FIELD_ALIASES: Record<string, FieldName> = { notificationsEnabled: 'reminderMinutes' }
 
+const MAX_GROUP_CHIPS = 6
+
 const newLocalId = () => `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
-export function LessonEditor({ role, existing, slot, onClose, onSave, onDelete }: Props) {
+export function LessonEditor({ role, existing, slot, onClose, onSave, onDelete, groupSuggestions = [] }: Props) {
   const dialogRef = useDialog<HTMLFormElement>(onClose)
   // Captured once: a profile/role change while the editor is open must not move the lesson to the other schedule.
   const [lessonRole] = useState<Role>(existing?.role ?? role)
@@ -52,6 +56,10 @@ export function LessonEditor({ role, existing, slot, onClose, onSave, onDelete }
   const [error, setError] = useState('')
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
   const [busy, setBusy] = useState(false)
+  const suggestGroups = lessonRole === 'teacher' && groupSuggestions.length > 0
+  const typedGroup = group.trim().toLocaleLowerCase('ro')
+  const groupChips = suggestGroups && !groupSuggestions.some((name) => name.toLocaleLowerCase('ro') === typedGroup)
+    ? groupSuggestions.filter((name) => name.toLocaleLowerCase('ro').includes(typedGroup)).slice(0, MAX_GROUP_CHIPS) : []
 
   const fail = (message: string, fields: FieldErrors = {}) => { setError(message); setFieldErrors(fields) }
   const showFailure = (failure: EditorFailure) => {
@@ -110,9 +118,14 @@ export function LessonEditor({ role, existing, slot, onClose, onSave, onDelete }
       </div>
       <label>Disciplina<input required maxLength={LESSON_LIMITS.title} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="ex. Algoritmi" {...invalid('title')} />{fieldMessage('title')}</label>
       <div className="form-row">
-        <label>Grupa<input maxLength={LESSON_LIMITS.group} value={group} onChange={(e) => setGroup(e.target.value)} placeholder="ex. FAF-241" {...invalid('groupName')} />{fieldMessage('groupName')}</label>
+        <label>Grupa<input maxLength={LESSON_LIMITS.group} value={group} onChange={(e) => setGroup(e.target.value)} placeholder="ex. FAF-241" list={suggestGroups ? 'lesson-group-suggestions' : undefined} autoComplete="off" {...invalid('groupName')} />{fieldMessage('groupName')}</label>
         <label>Sala<input maxLength={LESSON_LIMITS.room} value={room} onChange={(e) => setRoom(e.target.value)} placeholder="ex. 213/4" {...invalid('room')} />{fieldMessage('room')}</label>
       </div>
+      {suggestGroups && <datalist id="lesson-group-suggestions">{groupSuggestions.map((name) => <option key={name} value={name} />)}</datalist>}
+      {groupChips.length > 0 && <div className="group-suggestions" role="group" aria-label="Grupele tale">
+        <small>Grupele tale:</small>
+        {groupChips.map((name) => <button type="button" key={name} onClick={() => setGroup(name)}><span aria-hidden="true">👥</span>{name}</button>)}
+      </div>}
       {lessonRole === 'student' && <label>Profesor<input maxLength={LESSON_LIMITS.teacher} value={teacher} onChange={(e) => setTeacher(e.target.value)} placeholder="ex. D. Rusu (opțional)" {...invalid('teacherName')} />{fieldMessage('teacherName')}</label>}
       <div className="form-row">
         <label>Ziua<select value={day} onChange={(e) => setDay(Number(e.target.value))} {...invalid('weekday')}>{weekdayNames.map((name, index) => <option key={name} value={index}>{name}</option>)}</select>{fieldMessage('weekday')}</label>

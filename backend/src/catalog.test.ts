@@ -5,7 +5,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { academicDatabase, closeAcademicDatabase, ensureAcademicSchema, isConnectionError } from "./academic.js";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
-import { openDatabase } from "./db.js";
+import { openDatabase, type SqliteDatabase } from "./db.js";
+import { backfillAllCatalogGroups, isOwnerSynced } from "./groupSync.js";
 import { attendanceSchema, catalogDateSchema, gradeSchema, groupPatchSchema, studentPatchSchema } from "./validation.js";
 
 describe("catalog validation", () => {
@@ -46,6 +47,7 @@ const databaseUrl = process.env.DATABASE_URL_TEST?.trim() ?? "";
 describe.skipIf(!databaseUrl)("Teacher Catalog API (PostgreSQL)", () => {
   let server: Server;
   let base = "";
+  let sqlite: SqliteDatabase;
   const warnings: string[] = [];
 
   const api = async (path: string, init: RequestInit = {}, user = "1001") => {
@@ -72,7 +74,8 @@ describe.skipIf(!databaseUrl)("Teacher Catalog API (PostgreSQL)", () => {
 
     vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => { warnings.push(args.join(" ")); });
     const config = loadConfig({ ALLOW_DEV_AUTH: "true", RATE_LIMIT_PER_MINUTE: "1000", DATABASE_URL: databaseUrl });
-    const app = createApp({ db: openDatabase(":memory:"), config, log: { error: () => undefined, warn: () => undefined } });
+    sqlite = openDatabase(":memory:");
+    const app = createApp({ db: sqlite, config, log: { error: () => undefined, warn: () => undefined } });
     server = app.listen(0, "127.0.0.1");
     await new Promise((resolve) => server.once("listening", resolve));
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -193,5 +196,83 @@ describe.skipIf(!databaseUrl)("Teacher Catalog API (PostgreSQL)", () => {
     spy.mockRestore();
     expect((await api("/api/teacher/groups")).status).toBe(200);
     expect((await (await fetch(`${base}/health`)).json()).postgres).toBe("ready");
+  });
+
+  // ---- Lessons ↔ catalog group link ----
+  type Group = { id: string, name: string, subject: string | null, linkedLessons: number, subjects: string[] };
+  const lessonBody = { role: "teacher", title: "PC", groupName: "IBM-261", teacherName: null, room: null, weekday: 2, startTime: "10:00", endTime: "11:30", weekKind: "every", reminderMinutes: 15, notificationsEnabled: true };
+  /** Lessons written straight into SQLite behave like lessons saved before the link existed. */
+  const legacyLesson = (ownerId: number, role: string, title: string, groupName: string | null) =>
+    sqlite.prepare("INSERT INTO lessons (owner_id,role,title,group_name,weekday,start_time,end_time) VALUES (?,?,?,?,1,'08:00','09:30')").run(ownerId, role, title, groupName);
+  const groupsOf = async (user: string) => (await api("/api/teacher/groups", {}, user)).body as Group[];
+  const silent = { warn: () => undefined, log: () => undefined };
+
+  it("imports the groups of existing teacher lessons once, with linkedLessons and subjects", async () => {
+    legacyLesson(4004, "teacher", "PC", "IBM-261");
+    legacyLesson(4004, "teacher", "PC", "R-261");
+    legacyLesson(4004, "teacher", "TPA", "Sad-262");
+    legacyLesson(4004, "teacher", "Laborator TPA", " sad-262 ");
+    legacyLesson(4004, "student", "Fizică", "X-100");
+    expect((await post("/api/teacher/groups", { name: "r-261" }, "4004")).status).toBe(201);
+    const groups = await groupsOf("4004");
+    expect(groups.map((group) => [group.name, group.subject, group.linkedLessons, group.subjects])).toEqual([
+      ["IBM-261", "PC", 1, ["PC"]], ["r-261", null, 1, ["PC"]], ["Sad-262", "TPA", 2, ["Laborator TPA", "TPA"]]
+    ]);
+    expect(isOwnerSynced(sqlite, 4004)).toBe(true);
+    expect((await groupsOf("4004")).length).toBe(3);
+  });
+
+  it("does not recreate deleted groups on GET; a later lesson save does; rename/delete never touch lessons", async () => {
+    const before = await groupsOf("4004");
+    const ibm = before.find((group) => group.name === "IBM-261")!;
+    expect((await remove(`/api/teacher/groups/${ibm.id}`, "4004")).status).toBe(204);
+    expect((await groupsOf("4004")).map((group) => group.name)).toEqual(["r-261", "Sad-262"]);
+
+    // Student lessons never create catalog groups.
+    expect((await post("/api/lessons", { ...lessonBody, role: "student", groupName: "Y-200" }, "4004")).status).toBe(201);
+    const saved = await post("/api/lessons", { ...lessonBody, groupName: "ibm-261" }, "4004");
+    expect(saved.status).toBe(201);
+    const recreated = (await groupsOf("4004")).find((group) => group.name === "ibm-261")!;
+    expect(recreated).toMatchObject({ subject: "PC", linkedLessons: 2, subjects: ["PC"], student_count: 0 });
+
+    // PUT also ensures the group of the resulting teacher lesson (role kept when omitted).
+    const { role: _role, ...withoutRole } = lessonBody;
+    expect((await api(`/api/lessons/${saved.body.id}`, { method: "PUT", body: JSON.stringify({ ...withoutRole, title: "TPA", groupName: "TI-231" }) }, "4004")).status).toBe(200);
+    expect((await groupsOf("4004")).find((group) => group.name === "TI-231")).toMatchObject({ subject: "TPA", linkedLessons: 1, subjects: ["TPA"] });
+
+    const lessonsBefore = (await api("/api/lessons?role=teacher", {}, "4004")).body;
+    const sad = (await groupsOf("4004")).find((group) => group.name === "Sad-262")!;
+    const renamed = await patch(`/api/teacher/groups/${sad.id}`, { name: "Sad-262 A" }, "4004");
+    expect(renamed.body).toMatchObject({ name: "Sad-262 A", linkedLessons: 0, subjects: [] });
+    expect((await remove(`/api/teacher/groups/${sad.id}`, "4004")).status).toBe(204);
+    expect((await api("/api/lessons?role=teacher", {}, "4004")).body).toEqual(lessonsBefore);
+    const created = await post("/api/teacher/groups", { name: "SAD-262" }, "4004");
+    expect(created.body).toMatchObject({ name: "SAD-262", linkedLessons: 2, subjects: ["Laborator TPA", "TPA"] });
+  });
+
+  it("saves the lesson (201) when PostgreSQL is down during the group sync", async () => {
+    const pool = academicDatabase(databaseUrl)!;
+    const spy = vi.spyOn(pool, "connect").mockRejectedValueOnce(Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), { code: "ECONNREFUSED" }) as never);
+    const saved = await post("/api/lessons", { ...lessonBody, groupName: "TI-999" }, "4004");
+    expect(saved.status).toBe(201);
+    expect(saved.body).toMatchObject({ groupName: "TI-999", role: "teacher" });
+    spy.mockRestore();
+    const groups = await groupsOf("4004");
+    expect(groups.find((group) => group.name === "TI-999")).toBeUndefined();
+    expect(groups.find((group) => group.name === "SAD-262")).toBeDefined();
+  });
+
+  it("startup backfill imports unsynced owners only and respects the group limit", async () => {
+    legacyLesson(5005, "teacher", "PC", "A-1");
+    legacyLesson(5005, "teacher", "PC", "B-1");
+    legacyLesson(5005, "teacher", "PC", "C-1");
+    const logged: string[] = [];
+    await backfillAllCatalogGroups(sqlite, databaseUrl, 2, undefined, { ...silent, warn: (...args: unknown[]) => { logged.push(args.join(" ")); } });
+    expect(logged.some((line) => line.includes("skipped 1 group(s): C-1"))).toBe(true);
+    expect(isOwnerSynced(sqlite, 5005)).toBe(true);
+    expect((await groupsOf("5005")).map((group) => group.name)).toEqual(["A-1", "B-1"]);
+    // Owner 4004 is already synced: the TI-999 lesson saved while PostgreSQL was down is not re-imported.
+    await backfillAllCatalogGroups(sqlite, databaseUrl, 200, undefined, silent);
+    expect((await groupsOf("4004")).find((group) => group.name === "TI-999")).toBeUndefined();
   });
 });

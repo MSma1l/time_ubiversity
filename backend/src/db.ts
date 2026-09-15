@@ -21,7 +21,9 @@ export function openDatabase(path: string): SqliteDatabase {
   db.exec(`CREATE TABLE IF NOT EXISTS profiles (telegram_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'student', timezone TEXT NOT NULL DEFAULT 'Europe/Chisinau');
     CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, role TEXT NOT NULL, title TEXT NOT NULL, group_name TEXT, teacher_name TEXT, room TEXT, weekday INTEGER NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL, week_kind TEXT NOT NULL DEFAULT 'every', reminder_minutes INTEGER NOT NULL DEFAULT 15, notifications_enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS delivered_reminders (lesson_id INTEGER NOT NULL, occurrence_key TEXT NOT NULL, PRIMARY KEY (lesson_id, occurrence_key));
-    CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, read_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, role TEXT);`);
+    CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, read_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, role TEXT);
+    -- Owners whose existing teacher-lesson groups were imported once into the Teacher Catalog (groupSync.ts).
+    CREATE TABLE IF NOT EXISTS catalog_group_sync (owner_id INTEGER PRIMARY KEY, synced_at TEXT NOT NULL);`);
   migrateLegacySchema(db);
   db.exec(`CREATE INDEX IF NOT EXISTS lessons_owner_idx ON lessons(owner_id, weekday, start_time);
     CREATE INDEX IF NOT EXISTS lessons_weekday_idx ON lessons(weekday) WHERE notifications_enabled=1;
