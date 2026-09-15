@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { deleteLessonRemote, devTelegramId, errorMessage, loadAccount, markNotificationsRead, saveLessonRemote, updateLessonRemote, updateProfileState, updateRole } from './api'
+import { ApiError, deleteLessonRemote, devTelegramId, errorMessage, loadAccount, markNotificationsRead, saveLessonRemote, updateLessonRemote, updateProfileState, updateRole } from './api'
 import { BellIcon, LessonCard } from './components/LessonCard'
-import { LessonEditor } from './components/LessonEditor'
+import { LessonEditor, type EditorFailure } from './components/LessonEditor'
 import { CalendarPanel, NotificationPanel, ProfilePanel } from './components/Panels'
 import { TeacherCatalog } from './components/TeacherCatalog'
 import { initialOf, minutesLabel, roleLabels } from './labels'
@@ -47,7 +47,8 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   const [loadError, setLoadError] = useState('')
   const [reloadKey, setReloadKey] = useState(0)
   const [notice, setNotice] = useState<Notice | null>(null)
-  const [editor, setEditor] = useState<{ lesson: Lesson | null, slot: { day: number, time: string } | null } | null>(null)
+  /** `role` is the schedule chosen when the editor opened; later role changes do not affect the lesson being edited. */
+  const [editor, setEditor] = useState<{ lesson: Lesson | null, slot: { day: number, time: string } | null, role: Role } | null>(null)
   const [calendarOpen, setCalendarOpen] = useState(false)
   const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [profileOpen, setProfileOpen] = useState(false)
@@ -116,6 +117,10 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
     return null
   }, [lessons, role, today])
 
+  /** Lesson notifications belong to one schedule; general ones (no role) appear in both. */
+  const belongsToRole = (item: AppNotification) => !item.role || item.role === role
+  const roleNotifications = notifications.filter(belongsToRole)
+
   const reminderStatus = useMemo(() => {
     const roleLessons = lessons.filter((item) => item.role === role)
     const active = roleLessons.filter((item) => item.notificationsEnabled)
@@ -130,44 +135,56 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
     return { title, text: 'Memento-ul fiecărei ore se setează din editorul orei.' }
   }, [lessons, nextLesson, role])
 
-  /** Returns false (and shows why) when a change cannot be persisted right now. */
-  const ensureWritable = () => {
-    if (synced || syncState === 'demo') return true
-    failure(syncState === 'loading' ? 'Orarul încă se încarcă. Încearcă în câteva secunde.' : 'Orarul nu este sincronizat. Apasă „Reîncearcă” mai întâi.')
-    return false
+  /** Returns the reason (also shown as a notice) when a change cannot be persisted right now, otherwise null. */
+  const notWritableReason = () => {
+    if (synced || syncState === 'demo') return null
+    return syncState === 'loading' ? 'Orarul încă se încarcă. Încearcă în câteva secunde.' : 'Orarul nu este sincronizat. Apasă „Reîncearcă” mai întâi.'
   }
+  const failureOf = (error: unknown, fallback: string): EditorFailure => ({
+    message: errorMessage(error, fallback),
+    fields: error instanceof ApiError ? error.fields.map(({ path, message }) => ({ path, message })) : [],
+  })
 
-  const saveLesson = async (lesson: Lesson, isNew: boolean) => {
-    if (!ensureWritable()) return false
+  /** Saves through the API and stores the server's version (real id, normalised values). Never drops a failure silently. */
+  const saveLesson = async (lesson: Lesson, isNew: boolean): Promise<EditorFailure | null> => {
+    const blocked = notWritableReason()
+    if (blocked) return { message: blocked, fields: [] }
     try {
       const saved = synced ? await (isNew ? saveLessonRemote(lesson) : updateLessonRemote(lesson)) : lesson
       setLessons((items) => isNew ? [...items, saved] : items.map((item) => item.id === lesson.id ? saved : item))
       setEditor(null)
-      success(isNew ? (synced ? 'Ora a fost salvată și se va sincroniza cu botul.' : 'Ora a fost adăugată doar local (mod demonstrativ).') : 'Ora a fost modificată.')
-      return true
+      // Show the day of the saved lesson, and say so when its week parity hides it this week.
+      setActiveDay(saved.weekday)
+      const hiddenThisWeek = lessonMatchesWeek(saved, week) ? '' : ` Apare doar în săptămânile ${saved.weekType === 'even' ? 'pare' : 'impare'} (aceasta este ${week === 'even' ? 'pară' : 'impară'}).`
+      success((isNew ? (synced ? `Ora a fost salvată în orarul de ${roleLabels[saved.role]}.` : 'Ora a fost adăugată doar local (mod demonstrativ).') : 'Ora a fost modificată.') + hiddenThisWeek)
+      return null
     } catch (error) {
-      failure(errorMessage(error, isNew ? 'Ora nu a putut fi salvată. Încearcă din nou.' : 'Modificarea nu a putut fi salvată.'))
-      return false
+      return failureOf(error, isNew ? 'Ora nu a putut fi salvată. Încearcă din nou.' : 'Modificarea nu a putut fi salvată.')
     }
   }
 
-  const removeLesson = async (lesson: Lesson) => {
-    if (!ensureWritable() || !(await confirmAction(`Ștergi „${lesson.title}”?`))) return
+  const removeLesson = async (lesson: Lesson): Promise<EditorFailure | null> => {
+    const blocked = notWritableReason()
+    if (blocked) return { message: blocked, fields: [] }
+    if (!(await confirmAction(`Ștergi „${lesson.title}”?`))) return null
     try {
       if (synced) await deleteLessonRemote(lesson.id)
       setLessons((items) => items.filter((item) => item.id !== lesson.id))
       setEditor(null)
       success('Ora a fost ștearsă.')
+      return null
     } catch (error) {
-      failure(errorMessage(error, 'Ora nu a putut fi ștearsă.'))
+      return failureOf(error, 'Ora nu a putut fi ștearsă.')
     }
   }
 
-  const openNewLesson = (day = activeDay, time = '08:00') => setEditor({ lesson: null, slot: { day: Math.min(day, weekdayNames.length - 1), time } })
-  const openLesson = (lesson: Lesson) => setEditor({ lesson, slot: null })
+  const openNewLesson = (day = activeDay, time = '08:00') => setEditor({ lesson: null, slot: { day: Math.min(day, weekdayNames.length - 1), time }, role })
+  const openLesson = (lesson: Lesson) => setEditor({ lesson, slot: null, role: lesson.role })
 
   const chooseRole = async (next: Role) => {
     if (next === role) return
+    // Before the profile is loaded the server role would overwrite a local choice.
+    if (syncState === 'loading') { failure('Orarul încă se încarcă. Încearcă în câteva secunde.'); return }
     if (!roleEnabled[next]) { failure(`Modul ${roleLabels[next]} este dezactivat. Activează-l din Profil.`); return }
     const previous = role
     setRole(next)
@@ -175,6 +192,7 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   }
 
   const toggleRoleEnabled = async (kind: Role) => {
+    if (syncState === 'loading') { failure('Orarul încă se încarcă. Încearcă în câteva secunde.'); return }
     const next = !roleEnabled[kind]
     const other: Role = kind === 'student' ? 'teacher' : 'student'
     if (!next && !roleEnabled[other]) { failure('Cel puțin un mod trebuie să rămână activ.'); return }
@@ -194,19 +212,19 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
 
   const openNotifications = async () => {
     setNotificationsOpen(true)
-    if (!notifications.some((item) => !item.readAt)) return
+    if (!roleNotifications.some((item) => !item.readAt)) return
     try {
-      if (synced) await markNotificationsRead()
+      if (synced) await markNotificationsRead(role)
       else if (syncState !== 'demo') return
       const readAt = new Date().toISOString()
-      setNotifications((items) => items.map((item) => ({ ...item, readAt: item.readAt ?? readAt })))
+      setNotifications((items) => items.map((item) => belongsToRole(item) ? { ...item, readAt: item.readAt ?? readAt } : item))
     } catch (error) {
       failure(errorMessage(error, 'Notificările nu au putut fi marcate ca citite.'))
     }
   }
 
   const dateForDay = (dayIndex: number) => addDays(today.isoDate, dayIndex - today.weekdayIndex)
-  const unreadCount = notifications.filter((item) => !item.readAt).length
+  const unreadCount = roleNotifications.filter((item) => !item.readAt).length
   const isToday = activeDay === today.weekdayIndex
 
   return <main className="app-shell">
@@ -267,9 +285,9 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
     </footer>
 
     {calendarOpen && <CalendarPanel lessons={lessons} role={role} week={week} onClose={() => setCalendarOpen(false)} onAdd={openNewLesson} onEdit={(lesson) => { setCalendarOpen(false); openLesson(lesson) }} />}
-    {editor && <LessonEditor key={editor.lesson?.id ?? 'new'} role={role} existing={editor.lesson} slot={editor.slot} onClose={() => setEditor(null)}
+    {editor && <LessonEditor key={editor.lesson?.id ?? 'new'} role={editor.role} existing={editor.lesson} slot={editor.slot} onClose={() => setEditor(null)}
       onSave={(lesson) => saveLesson(lesson, !editor.lesson)} onDelete={editor.lesson ? () => removeLesson(editor.lesson as Lesson) : undefined} />}
-    {notificationsOpen && <NotificationPanel items={notifications} onClose={() => setNotificationsOpen(false)} />}
+    {notificationsOpen && <NotificationPanel items={roleNotifications} onClose={() => setNotificationsOpen(false)} />}
     {profileOpen && <ProfilePanel name={name} role={role} week={week} enabled={roleEnabled} synced={synced} onClose={() => setProfileOpen(false)}
       onSwitchRole={() => chooseRole(role === 'student' ? 'teacher' : 'student')} onToggle={toggleRoleEnabled} onOpenGroupSettings={() => { setProfileOpen(false); setGroupSettingsOpen(true) }} />}
     {groupSettingsOpen && <TeacherCatalog mode="settings" available={synced} onClose={() => setGroupSettingsOpen(false)} />}

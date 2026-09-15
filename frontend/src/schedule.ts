@@ -68,7 +68,13 @@ export function lessonMatchesWeek(lesson: Lesson, week: WeekType) {
   return lesson.weekType === 'both' || lesson.weekType === week
 }
 
-export const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/
+
+/** "9:30", "09:30" and "09:30:00" (some mobile WebViews) → "09:30"; anything else → "". */
+export function normalizeTime(value: string | undefined | null) {
+  const match = /^(\d{1,2}):([0-5]\d)(?::[0-5]\d(?:\.\d{1,3})?)?$/.exec((value ?? '').trim())
+  if (!match || Number(match[1]) > 23) return ''
+  return `${match[1].padStart(2, '0')}:${match[2]}`
+}
 
 export function timeToMinutes(time: string) {
   const [hours, minutes] = time.split(':').map(Number)

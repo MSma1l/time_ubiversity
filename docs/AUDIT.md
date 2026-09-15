@@ -145,3 +145,29 @@ webhook real înregistrat la Telegram.
 | D8 | Nu există endpoint-uri pentru ștergerea grupelor/studenților sau citirea notelor. | Funcționalitate de adăugat ulterior. |
 | D9 | Comanda bot `/notificari on\|off` suprascrie setarea fiecărei lecții. | Alegerile per lecție se pierd la folosirea comenzii. |
 | D10 | Rate limit-ul este în memorie. | Corect pentru o singură instanță `api`; la scalare orizontală ar trebui Redis. |
+
+## 6. Salvarea orarului și separarea Student / Profesor
+
+Plângere: „orarul nu se salvează; ca Student și ca Profesor trebuie să am orare diferite”.
+În producție (versiunea veche): `POST /api/lessons 400`.
+
+**Cauza erorii 400 (versiunea veche, `Orar-Univer-Docker.zip`):** editorul trimitea mereu
+`endTime: existing?.endTime ?? '09:30'` (nu avea câmp pentru ora de final). Orice oră nouă care
+începea la 09:30 sau mai târziu era respinsă de backend (`endTime > startTime`), iar mesajul de
+eroare era ascuns. Tot acolo, `PUT` trimitea rolul *activ* în loc de rolul lecției. Codul actual
+are câmp de final, validare locală și trimite rolul lecției — eroarea nu mai apare.
+
+| # | Problemă găsită în codul actual | Reparare |
+|---|---|---|
+| S1 | Erorile de salvare/ștergere apăreau în notificarea din spatele editorului (modal) — utilizatorul nu vedea de ce „nu se salvează”. | Editorul afișează mesajul serverului și marchează câmpurile respinse (`aria-invalid` + text sub câmp); mesajele zod ale lecțiilor sunt în română. |
+| S2 | Grupa era obligatorie în editor, deși backend-ul o acceptă goală. | Grupa este opțională. |
+| S3 | O oră pară/impară salvată în săptămâna cealaltă „dispărea” din listă. | După salvare se selectează ziua lecției, iar mesajul spune în ce săptămâni apare. |
+| S4 | Rolul unei ore noi era citit la salvare; o schimbare de rol cu editorul deschis o muta în celălalt orar. | Rolul se fixează la deschiderea editorului; `PUT` fără `role` păstrează rolul existent. |
+| S5 | Notificările și contorul erau comune ambelor roluri; botul `/azi`, `/saptamana` amesteca orele. | `notifications.role` (null = general); contor/listă/marcare citite pe rolul activ; botul arată orarul rolului activ. |
+| S6 | Ore în format `9:30` / `09:30:00` (unele WebView-uri) → 400 sau comparație greșită. | Normalizare la `HH:MM` în frontend, backend și migrare. |
+| S7 | Baze vechi fără coloane `role` etc. sau cu valori nevalide ar fi dat 500 / ore invizibile. | Migrare idempotentă: coloane lipsă adăugate, roluri/săptămâni/ore normalizate (implicit Student). |
+
+Verificat: scenariu UI în Chrome headless (dev auth) — creare/editare/ștergere ca Student și
+Profesor, 08:00/09:30/13:15/18:00, pară/impară/fiecare, câmpuri opționale goale, memento oprit,
+reîncărcare: toate persistă și rămân separate; DB creată cu schema veche se deschide cu orele
+vizibile în rolul corect. Teste backend: 52.

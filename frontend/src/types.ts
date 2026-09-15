@@ -22,6 +22,8 @@ export type AppNotification = {
   kind: 'reminder' | 'system'
   title: string
   body: string
+  /** Schedule the notification belongs to; null/absent for general messages shown in both modes. */
+  role?: Role | null
   readAt: string | null
   createdAt: string
 }

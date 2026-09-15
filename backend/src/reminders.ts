@@ -44,7 +44,7 @@ export async function sendDueReminders(db: SqliteDatabase, send: ReminderSender,
     sent += 1;
     try {
       addNotification(db, lesson.ownerId, "reminder", due.minutesUntilStart > 0 ? `În ${due.minutesUntilStart} minute începe ${lesson.title}`
-        : due.minutesUntilStart < 0 ? `${lesson.title} a început acum ${-due.minutesUntilStart} minute` : `Acum începe ${lesson.title}`, lessonDetails(lesson));
+        : due.minutesUntilStart < 0 ? `${lesson.title} a început acum ${-due.minutesUntilStart} minute` : `Acum începe ${lesson.title}`, lessonDetails(lesson), lesson.role);
     } catch (error) { log.error("Could not store reminder notification:", error); }
   }
   return sent;

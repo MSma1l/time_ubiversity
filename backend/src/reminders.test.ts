@@ -27,6 +27,7 @@ describe("sendDueReminders", () => {
     expect(await sendDueReminders(db, send, new Date(AT_0745.getTime() + 60_000), silent)).toBe(0);
     expect(sent).toEqual([[1, "🔔 În 15 min: Fizică\n08:00–09:30 · Sala 3-101"]]);
     expect(db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE kind='reminder'").get()).toEqual({ c: 1 });
+    expect(db.prepare("SELECT role FROM notifications WHERE kind='reminder'").get()).toEqual({ role: "student" });
   });
 
   it("retries transient failures but not blocked users, and skips disabled role modes", async () => {

@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { useDialog } from '../dialogs'
-import { minutesLabel } from '../labels'
-import { minutesToTime, TIME_PATTERN, timeToMinutes, weekdayNames } from '../schedule'
+import { minutesLabel, roleLabels } from '../labels'
+import { minutesToTime, normalizeTime, timeToMinutes, weekdayNames } from '../schedule'
 import type { Lesson, Role } from '../types'
 
 /** Mirrors backend lessonSchema limits. */
@@ -11,22 +11,32 @@ const DEFAULT_REMINDER_MINUTES = 15
 const REMINDER_OPTIONS = [5, 10, 15, 30, 60]
 const REMINDER_OFF = 'off'
 
+/** Why a save/delete failed: a Romanian message and the backend fields it concerns. */
+export type EditorFailure = { message: string, fields: Array<{ path: string, message: string }> }
+
 type Props = {
+  /** Schedule of a new lesson, fixed when the editor opens; an existing lesson always keeps its own role. */
   role: Role
   existing: Lesson | null
   slot: { day: number, time: string } | null
   onClose(): void
-  /** Resolves to true when the lesson was saved (the parent closes the editor). */
-  onSave(lesson: Lesson): Promise<boolean>
-  onDelete?(): Promise<void>
+  /** Resolves to null when the lesson was saved (the parent closes the editor), otherwise to the reason. */
+  onSave(lesson: Lesson): Promise<EditorFailure | null>
+  onDelete?(): Promise<EditorFailure | null>
 }
+
+/** Backend field names (lessonSchema) that have a control in this form. */
+type FieldName = 'title' | 'groupName' | 'teacherName' | 'room' | 'weekday' | 'weekKind' | 'startTime' | 'endTime' | 'reminderMinutes'
+type FieldErrors = Partial<Record<FieldName, string>>
+const FIELD_ALIASES: Record<string, FieldName> = { notificationsEnabled: 'reminderMinutes' }
 
 const newLocalId = () => `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
 export function LessonEditor({ role, existing, slot, onClose, onSave, onDelete }: Props) {
   const dialogRef = useDialog<HTMLFormElement>(onClose)
-  const lessonRole = existing?.role ?? role
-  const initialStart = existing?.startTime ?? slot?.time ?? '08:00'
+  // Captured once: a profile/role change while the editor is open must not move the lesson to the other schedule.
+  const [lessonRole] = useState<Role>(existing?.role ?? role)
+  const initialStart = normalizeTime(existing?.startTime ?? slot?.time) || '08:00'
   const [title, setTitle] = useState(existing?.title ?? '')
   const [group, setGroup] = useState(existing?.group ?? '')
   const [teacher, setTeacher] = useState(existing?.teacher ?? '')
@@ -34,69 +44,88 @@ export function LessonEditor({ role, existing, slot, onClose, onSave, onDelete }
   const [day, setDay] = useState(existing?.weekday ?? slot?.day ?? 0)
   const [week, setWeek] = useState<Lesson['weekType']>(existing?.weekType ?? 'both')
   const [startTime, setStartTime] = useState(initialStart)
-  const [endTime, setEndTime] = useState(existing?.endTime ?? minutesToTime(timeToMinutes(initialStart) + DEFAULT_DURATION_MINUTES))
+  const [endTime, setEndTime] = useState(normalizeTime(existing?.endTime) || minutesToTime(timeToMinutes(initialStart) + DEFAULT_DURATION_MINUTES))
   const savedMinutes = existing?.reminderMinutes ?? DEFAULT_REMINDER_MINUTES
   const [reminder, setReminder] = useState(existing && !existing.notificationsEnabled ? REMINDER_OFF : String(savedMinutes))
   // Keep a custom value (e.g. set before this control existed) selectable.
   const reminderOptions = REMINDER_OPTIONS.includes(savedMinutes) ? REMINDER_OPTIONS : [...REMINDER_OPTIONS, savedMinutes].sort((a, b) => a - b)
   const [error, setError] = useState('')
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
   const [busy, setBusy] = useState(false)
+
+  const fail = (message: string, fields: FieldErrors = {}) => { setError(message); setFieldErrors(fields) }
+  const showFailure = (failure: EditorFailure) => {
+    const fields: FieldErrors = {}
+    for (const field of failure.fields) {
+      const name = (FIELD_ALIASES[field.path] ?? field.path) as FieldName
+      fields[name] ??= field.message
+    }
+    fail(failure.message, fields)
+  }
+  /** Marks a control invalid and links it to its message. */
+  const invalid = (name: FieldName) => fieldErrors[name] ? { 'aria-invalid': true, 'aria-describedby': `lesson-${name}-error` } : {}
+  const fieldMessage = (name: FieldName) => fieldErrors[name] ? <small className="field-error" id={`lesson-${name}-error`}>{fieldErrors[name]}</small> : null
 
   const changeStart = (value: string) => {
     // Keep the lesson duration when the start time moves.
-    if (TIME_PATTERN.test(value) && TIME_PATTERN.test(startTime) && TIME_PATTERN.test(endTime)) {
-      setEndTime(minutesToTime(timeToMinutes(value) + Math.max(timeToMinutes(endTime) - timeToMinutes(startTime), 5)))
-    }
+    const [next, start, end] = [normalizeTime(value), normalizeTime(startTime), normalizeTime(endTime)]
+    if (next && start && end) setEndTime(minutesToTime(timeToMinutes(next) + Math.max(timeToMinutes(end) - timeToMinutes(start), 5)))
     setStartTime(value)
   }
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     if (busy) return
-    if (!title.trim()) return setError('Completează disciplina.')
-    if (!group.trim()) return setError('Completează grupa.')
-    if (!TIME_PATTERN.test(startTime) || !TIME_PATTERN.test(endTime)) return setError('Alege ora de început și de final.')
-    if (timeToMinutes(endTime) <= timeToMinutes(startTime)) return setError('Ora de final trebuie să fie după ora de început.')
-    setError('')
+    const start = normalizeTime(startTime)
+    const end = normalizeTime(endTime)
+    if (!title.trim()) return fail('Completează disciplina.', { title: 'Câmpul este obligatoriu' })
+    if (!start) return fail('Alege ora de început.', { startTime: 'Ora trebuie să fie în format HH:MM' })
+    if (!end) return fail('Alege ora de final.', { endTime: 'Ora trebuie să fie în format HH:MM' })
+    if (timeToMinutes(end) <= timeToMinutes(start)) return fail('Ora de final trebuie să fie după ora de început.', { endTime: 'Trebuie să fie după ora de început' })
+    fail('')
     setBusy(true)
-    const saved = await onSave({
+    const failure = await onSave({
       id: existing?.id ?? newLocalId(), role: lessonRole, title: title.trim(), group: group.trim(), teacher: teacher.trim() || undefined,
-      weekday: day, startTime, endTime, room: room.trim() || '—', weekType: week,
+      weekday: day, startTime: start, endTime: end, room: room.trim() || '—', weekType: week,
       reminderMinutes: reminder === REMINDER_OFF ? savedMinutes : Number(reminder), notificationsEnabled: reminder !== REMINDER_OFF,
     })
-    if (!saved) setBusy(false)
+    // On success the parent closes (unmounts) the editor; on failure the reason stays visible here.
+    if (failure) { showFailure(failure); setBusy(false) }
   }
 
   const remove = async () => {
     if (!onDelete || busy) return
+    fail('')
     setBusy(true)
-    try { await onDelete() } finally { setBusy(false) }
+    const failure = await onDelete()
+    if (failure) showFailure(failure)
+    setBusy(false)
   }
 
   return <div className="modal-backdrop" role="presentation">
     <form ref={dialogRef} className="editor" onSubmit={submit} role="dialog" aria-modal="true" aria-labelledby="editor-title" tabIndex={-1} noValidate>
       <div className="modal-heading">
-        <div><p>ORAR MANUAL</p><h2 id="editor-title">{existing ? 'Editează ora' : 'Adaugă o oră'}</h2></div>
+        <div><p>ORAR {roleLabels[lessonRole].toUpperCase()}</p><h2 id="editor-title">{existing ? 'Editează ora' : 'Adaugă o oră'}</h2></div>
         <button type="button" onClick={onClose} aria-label="Închide">×</button>
       </div>
-      <label>Disciplina<input required maxLength={LESSON_LIMITS.title} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="ex. Algoritmi" /></label>
+      <label>Disciplina<input required maxLength={LESSON_LIMITS.title} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="ex. Algoritmi" {...invalid('title')} />{fieldMessage('title')}</label>
       <div className="form-row">
-        <label>Grupa<input required maxLength={LESSON_LIMITS.group} value={group} onChange={(e) => setGroup(e.target.value)} placeholder="ex. FAF-241" /></label>
-        <label>Sala<input maxLength={LESSON_LIMITS.room} value={room} onChange={(e) => setRoom(e.target.value)} placeholder="ex. 213/4" /></label>
+        <label>Grupa<input maxLength={LESSON_LIMITS.group} value={group} onChange={(e) => setGroup(e.target.value)} placeholder="ex. FAF-241" {...invalid('groupName')} />{fieldMessage('groupName')}</label>
+        <label>Sala<input maxLength={LESSON_LIMITS.room} value={room} onChange={(e) => setRoom(e.target.value)} placeholder="ex. 213/4" {...invalid('room')} />{fieldMessage('room')}</label>
       </div>
-      {lessonRole === 'student' && <label>Profesor<input maxLength={LESSON_LIMITS.teacher} value={teacher} onChange={(e) => setTeacher(e.target.value)} placeholder="ex. D. Rusu (opțional)" /></label>}
+      {lessonRole === 'student' && <label>Profesor<input maxLength={LESSON_LIMITS.teacher} value={teacher} onChange={(e) => setTeacher(e.target.value)} placeholder="ex. D. Rusu (opțional)" {...invalid('teacherName')} />{fieldMessage('teacherName')}</label>}
       <div className="form-row">
-        <label>Ziua<select value={day} onChange={(e) => setDay(Number(e.target.value))}>{weekdayNames.map((name, index) => <option key={name} value={index}>{name}</option>)}</select></label>
-        <label>Săptămână<select value={week} onChange={(e) => setWeek(e.target.value as Lesson['weekType'])}><option value="both">În fiecare săptămână</option><option value="even">Pară</option><option value="odd">Impară</option></select></label>
+        <label>Ziua<select value={day} onChange={(e) => setDay(Number(e.target.value))} {...invalid('weekday')}>{weekdayNames.map((name, index) => <option key={name} value={index}>{name}</option>)}</select>{fieldMessage('weekday')}</label>
+        <label>Săptămână<select value={week} onChange={(e) => setWeek(e.target.value as Lesson['weekType'])} {...invalid('weekKind')}><option value="both">În fiecare săptămână</option><option value="even">Pară</option><option value="odd">Impară</option></select>{fieldMessage('weekKind')}</label>
       </div>
       <div className="form-row">
-        <label>Începe la<input type="time" required value={startTime} onChange={(e) => changeStart(e.target.value)} /></label>
-        <label>Se termină la<input type="time" required value={endTime} onChange={(e) => setEndTime(e.target.value)} /></label>
+        <label>Începe la<input type="time" required value={startTime} onChange={(e) => changeStart(e.target.value)} {...invalid('startTime')} />{fieldMessage('startTime')}</label>
+        <label>Se termină la<input type="time" required value={endTime} onChange={(e) => setEndTime(e.target.value)} {...invalid('endTime')} />{fieldMessage('endTime')}</label>
       </div>
-      <label>Memento<select value={reminder} onChange={(e) => setReminder(e.target.value)}>
+      <label>Memento<select value={reminder} onChange={(e) => setReminder(e.target.value)} {...invalid('reminderMinutes')}>
         <option value={REMINDER_OFF}>Fără memento</option>
         {reminderOptions.map((minutes) => <option key={minutes} value={String(minutes)}>{minutes === 0 ? 'La începutul orei' : `Cu ${minutesLabel(minutes)} înainte`}</option>)}
-      </select></label>
+      </select>{fieldMessage('reminderMinutes')}</label>
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="editor-actions">
         {onDelete && <button className="delete-button" type="button" onClick={remove} disabled={busy}>Șterge</button>}

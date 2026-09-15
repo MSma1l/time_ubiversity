@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { attendanceSchema, gradeSchema, groupSchema, lessonIdSchema, lessonSchema, profilePatchSchema, studentSchema } from "./validation.js";
+import { attendanceSchema, gradeSchema, groupSchema, lessonIdSchema, lessonSchema, lessonUpdateSchema, profilePatchSchema, studentSchema } from "./validation.js";
 
 const lesson = { role: "student", title: "Matematică", groupName: "", teacherName: null, room: " 3-101 ", weekday: 1, startTime: "08:00", endTime: "09:30", weekKind: "every", reminderMinutes: 15, notificationsEnabled: true };
 
@@ -17,6 +17,15 @@ describe("lessonSchema", () => {
     expect(lessonSchema.safeParse({ ...lesson, reminderMinutes: 181 }).success).toBe(false);
     expect(lessonSchema.safeParse({ ...lesson, weekKind: "both" }).success).toBe(false);
     expect(lessonSchema.safeParse({ ...lesson, weekday: "1" }).success).toBe(false);
+  });
+});
+
+describe("lessonUpdateSchema", () => {
+  it("allows omitting the role (kept by the server) but still rejects unknown roles", () => {
+    const { role: _role, ...withoutRole } = lesson;
+    expect(lessonUpdateSchema.parse(withoutRole).role).toBeUndefined();
+    expect(lessonUpdateSchema.safeParse({ ...lesson, role: "admin" }).success).toBe(false);
+    expect(lessonUpdateSchema.parse({ ...lesson, startTime: "8:05", endTime: "08:50:00" })).toMatchObject({ startTime: "08:05", endTime: "08:50" });
   });
 });
 

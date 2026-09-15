@@ -33,6 +33,23 @@ describe("botReply", () => {
   });
 });
 
+describe("botReply schedules", () => {
+  it("shows only the lessons of the active role", () => {
+    const db = openDatabase(":memory:");
+    const insert = db.prepare("INSERT INTO lessons (owner_id, role, title, weekday, start_time, end_time, week_kind) VALUES (?,?,?,?,?,?,?)");
+    insert.run(42, "student", "Fizică", 1, "08:00", "09:30", "every");
+    insert.run(42, "teacher", "Rețele", 1, "11:30", "13:00", "every");
+    const student = botReply(db, message("/azi"), NOW)?.text ?? "";
+    expect(student).toContain("Fizică");
+    expect(student).not.toContain("Rețele");
+    botReply(db, message("/rol profesor"), NOW);
+    const teacher = botReply(db, message("/saptamana"), NOW)?.text ?? "";
+    expect(teacher).toContain("Profesor");
+    expect(teacher).toContain("Rețele");
+    expect(teacher).not.toContain("Fizică");
+  });
+});
+
 describe("pollingBackoff", () => {
   it("backs off exponentially and honours Telegram hints", () => {
     expect(pollingBackoff(new Error("network"), 0)).toBe(1_000);

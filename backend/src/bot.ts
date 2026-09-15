@@ -7,6 +7,14 @@ import { deriveWebhookSecret, telegramApi, telegramApiResponse, TelegramApiError
 export type TelegramMessage = { text?: string, chat?: { id: number, type?: string }, from?: TelegramUser & { is_bot?: boolean } };
 export type TelegramUpdate = { update_id: number, message?: TelegramMessage };
 
+const ROLE_NAMES: Record<Lesson["role"], string> = { student: "Student", teacher: "Profesor" };
+
+/** The schedule the bot shows is the one of the profile's active role (as in the Mini App). */
+function activeRole(db: SqliteDatabase, userId: number): Lesson["role"] {
+  const profile = db.prepare("SELECT role FROM profiles WHERE telegram_id=?").get(userId) as { role?: string } | undefined;
+  return profile?.role === "teacher" ? "teacher" : "student";
+}
+
 function formatLesson(lesson: Lesson) { return `• ${lesson.startTime}–${lesson.endTime} — ${lesson.title}${lesson.room ? ` (sala ${lesson.room})` : ""}`; }
 
 /**
@@ -26,11 +34,13 @@ export function botReply(db: SqliteDatabase, message: TelegramMessage | undefine
   let answer = "";
   if (command === "/start" || command === "/help") answer = "Bun venit la Orar UTM!\n\n/azi — orarul de azi\n/saptamana — orarul săptămânii curente\n/rol student|profesor — schimbă rolul\n/notificari on|off — activează/dezactivează memento-urile\n/status — starea contului";
   else if (command === "/azi") {
-    const todayLessons = lessonRows(db, userId).filter((lesson) => lesson.weekday === clock.weekday && appliesInWeek(lesson.weekKind, clock.date));
-    answer = todayLessons.length ? `📚 Orarul de azi (săptămână ${kindLabel}):\n${todayLessons.map(formatLesson).join("\n")}` : "☀️ Ești liber azi — nu ai nicio pereche programată.";
+    const role = activeRole(db, userId);
+    const todayLessons = lessonRows(db, userId, role).filter((lesson) => lesson.weekday === clock.weekday && appliesInWeek(lesson.weekKind, clock.date));
+    answer = todayLessons.length ? `📚 Orarul de azi · ${ROLE_NAMES[role]} (săptămână ${kindLabel}):\n${todayLessons.map(formatLesson).join("\n")}` : `☀️ Ești liber azi — nu ai nicio pereche programată în orarul de ${ROLE_NAMES[role]}.`;
   } else if (command === "/saptamana") {
-    const entries = lessonRows(db, userId).filter((lesson) => appliesInWeek(lesson.weekKind, clock.date));
-    answer = entries.length ? `📅 Săptămâna ${kindLabel}:\n${entries.map((lesson) => `${["Lu", "Ma", "Mi", "Jo", "Vi", "Sâ", "Du"][lesson.weekday - 1]} ${formatLesson(lesson)}`).join("\n")}` : "Nu ai ore în această săptămână.";
+    const role = activeRole(db, userId);
+    const entries = lessonRows(db, userId, role).filter((lesson) => appliesInWeek(lesson.weekKind, clock.date));
+    answer = entries.length ? `📅 Săptămâna ${kindLabel} · ${ROLE_NAMES[role]}:\n${entries.map((lesson) => `${["Lu", "Ma", "Mi", "Jo", "Vi", "Sâ", "Du"][lesson.weekday - 1]} ${formatLesson(lesson)}`).join("\n")}` : `Nu ai ore în această săptămână în orarul de ${ROLE_NAMES[role]}.`;
   } else if (command === "/rol" && (argument === "student" || argument === "profesor")) {
     db.prepare("UPDATE profiles SET role=? WHERE telegram_id=?").run(argument === "profesor" ? "teacher" : "student", userId);
     answer = `Rol activ: ${argument}.`;

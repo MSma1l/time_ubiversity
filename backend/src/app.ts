@@ -10,7 +10,7 @@ import { addNotification, lessonById, lessonRows, upsertProfile, type SqliteData
 import { createRateLimiter, rateLimitMiddleware } from "./rateLimit.js";
 import { isoDateInChisinau, isValidIsoDate, SEMESTER_REFERENCE_KIND, SEMESTER_REFERENCE_MONDAY, universityWeekKind, universityWeekNumber } from "./schedule.js";
 import { safeEqual, validateInitData, type TelegramUser } from "./telegram.js";
-import { attendanceSchema, gradeSchema, groupSchema, lessonIdSchema, lessonSchema, profilePatchSchema, studentSchema, uuidSchema } from "./validation.js";
+import { attendanceSchema, gradeSchema, groupSchema, lessonIdSchema, lessonSchema, lessonUpdateSchema, notificationsReadSchema, profilePatchSchema, studentSchema, uuidSchema } from "./validation.js";
 
 export const LIMITS = { lessonsPerUser: 500, groupsPerTeacher: 200, studentsPerGroup: 500 };
 
@@ -104,20 +104,31 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     res.json({ date: requested, number: universityWeekNumber(requested), kind: universityWeekKind(requested), referenceMonday: SEMESTER_REFERENCE_MONDAY, referenceKind: SEMESTER_REFERENCE_KIND });
   });
 
-  app.get("/api/lessons", auth, (req, res) => res.json(lessonRows(db, userOf(req).id)));
+  const roleLabel = (role: string) => role === "teacher" ? "Profesor" : "Student";
+
+  // Student and Profesor schedules are two separate lists of the same user, told apart by `role`.
+  app.get("/api/lessons", auth, (req, res) => {
+    const role = req.query.role;
+    if (role !== undefined && role !== "student" && role !== "teacher") return res.status(400).json({ error: "Rolul trebuie să fie student sau teacher" });
+    res.json(lessonRows(db, userOf(req).id, role));
+  });
   app.post("/api/lessons", auth, (req, res) => {
     const input = lessonSchema.parse(req.body); const ownerId = userOf(req).id;
     const count = (db.prepare("SELECT COUNT(*) AS count FROM lessons WHERE owner_id=?").get(ownerId) as { count: number }).count;
     if (count >= LIMITS.lessonsPerUser) throw new HttpError(409, `Ai atins limita de ${LIMITS.lessonsPerUser} ore în orar.`);
-    const result = db.prepare(`INSERT INTO lessons (owner_id,role,title,group_name,teacher_name,room,weekday,start_time,end_time,week_kind,reminder_minutes,notifications_enabled) VALUES (@ownerId,@role,@title,@groupName,@teacherName,@room,@weekday,@startTime,@endTime,@weekKind,@reminderMinutes,@notificationsEnabled)`)
-      .run({ ...input, ownerId, notificationsEnabled: Number(input.notificationsEnabled) });
-    addNotification(db, ownerId, "system", "Orar actualizat", `Ai adăugat: ${input.title}, ${input.startTime}–${input.endTime}.`);
-    res.status(201).json(lessonById(db, ownerId, result.lastInsertRowid));
+    const created = db.transaction(() => {
+      const result = db.prepare(`INSERT INTO lessons (owner_id,role,title,group_name,teacher_name,room,weekday,start_time,end_time,week_kind,reminder_minutes,notifications_enabled) VALUES (@ownerId,@role,@title,@groupName,@teacherName,@room,@weekday,@startTime,@endTime,@weekKind,@reminderMinutes,@notificationsEnabled)`)
+        .run({ ...input, ownerId, notificationsEnabled: Number(input.notificationsEnabled) });
+      addNotification(db, ownerId, "system", "Orar actualizat", `Ai adăugat în orarul de ${roleLabel(input.role)}: ${input.title}, ${input.startTime}–${input.endTime}.`, input.role);
+      return lessonById(db, ownerId, result.lastInsertRowid);
+    })();
+    res.status(201).json(created);
   });
   app.put("/api/lessons/:id", auth, (req, res) => {
-    const id = lessonIdSchema.parse(req.params.id); const input = lessonSchema.parse(req.body); const ownerId = userOf(req).id;
-    const result = db.prepare(`UPDATE lessons SET role=@role,title=@title,group_name=@groupName,teacher_name=@teacherName,room=@room,weekday=@weekday,start_time=@startTime,end_time=@endTime,week_kind=@weekKind,reminder_minutes=@reminderMinutes,notifications_enabled=@notificationsEnabled,updated_at=CURRENT_TIMESTAMP WHERE id=@id AND owner_id=@ownerId`)
-      .run({ ...input, id, ownerId, notificationsEnabled: Number(input.notificationsEnabled) });
+    const id = lessonIdSchema.parse(req.params.id); const input = lessonUpdateSchema.parse(req.body); const ownerId = userOf(req).id;
+    // A missing role keeps the lesson in the schedule it already belongs to.
+    const result = db.prepare(`UPDATE lessons SET role=COALESCE(@role, role),title=@title,group_name=@groupName,teacher_name=@teacherName,room=@room,weekday=@weekday,start_time=@startTime,end_time=@endTime,week_kind=@weekKind,reminder_minutes=@reminderMinutes,notifications_enabled=@notificationsEnabled,updated_at=CURRENT_TIMESTAMP WHERE id=@id AND owner_id=@ownerId`)
+      .run({ ...input, role: input.role ?? null, id, ownerId, notificationsEnabled: Number(input.notificationsEnabled) });
     if (!result.changes) return res.status(404).json({ error: "Ora nu a fost găsită" });
     res.json(lessonById(db, ownerId, id));
   });
@@ -132,11 +143,14 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   });
 
   app.get("/api/notifications", auth, (req, res) => {
-    const rows = db.prepare("SELECT id, kind, title, body, read_at AS readAt, created_at AS createdAt FROM notifications WHERE owner_id=? ORDER BY id DESC LIMIT 50").all(userOf(req).id);
+    const rows = db.prepare("SELECT id, kind, title, body, role, read_at AS readAt, created_at AS createdAt FROM notifications WHERE owner_id=? ORDER BY id DESC LIMIT 50").all(userOf(req).id);
     res.json(rows);
   });
+  /** Marks notifications as read; with `{ role }` only that schedule's notifications (and general ones). */
   app.patch("/api/notifications/read", auth, (req, res) => {
-    db.prepare("UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE owner_id=? AND read_at IS NULL").run(userOf(req).id);
+    const role = notificationsReadSchema.parse(req.body)?.role;
+    if (role) db.prepare("UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE owner_id=? AND read_at IS NULL AND (role IS NULL OR role=?)").run(userOf(req).id, role);
+    else db.prepare("UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE owner_id=? AND read_at IS NULL").run(userOf(req).id);
     res.status(204).end();
   });
 

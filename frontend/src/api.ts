@@ -1,4 +1,4 @@
-import { universityClock } from './schedule'
+import { normalizeTime, universityClock } from './schedule'
 import type { AppNotification, Lesson, Role } from './types'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '').replace(/\/+$/, '')
@@ -6,29 +6,46 @@ const REQUEST_TIMEOUT_MS = 15_000
 /** Dev-only auth bypass (backend must run with ALLOW_DEV_AUTH=true). Stripped from production builds. */
 export const devTelegramId = import.meta.env.DEV ? (import.meta.env.VITE_DEV_TELEGRAM_ID ?? '') : ''
 
+/** A field rejected by the backend validation, with a user-facing Romanian message. */
+export type FieldError = { path: string, label: string, message: string }
+
 export class ApiError extends Error {
   readonly status: number
-  constructor(message: string, status: number) {
+  readonly fields: FieldError[]
+  constructor(message: string, status: number, fields: FieldError[] = []) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.fields = fields
   }
 }
 
-type ErrorBody = { error?: unknown, fields?: Array<{ path?: string }> }
+type ErrorBody = { error?: unknown, fields?: Array<{ path?: unknown, message?: unknown }> }
 
 const fieldLabels: Record<string, string> = {
   title: 'disciplina', groupName: 'grupa', teacherName: 'profesorul', room: 'sala', weekday: 'ziua', startTime: 'ora de început',
-  endTime: 'ora de final', weekKind: 'săptămâna', reminderMinutes: 'memento', name: 'numele grupei', subject: 'disciplina',
+  endTime: 'ora de final', weekKind: 'săptămâna', reminderMinutes: 'memento', notificationsEnabled: 'memento', role: 'rolul', name: 'numele grupei', subject: 'disciplina',
   firstName: 'prenumele', lastName: 'numele', grade: 'nota', laboratory: 'laboratorul', date: 'data', entries: 'prezența',
 }
 
-function messageForStatus(status: number, body: ErrorBody | null) {
+/** zod's English default messages (schemas without custom Romanian text) are replaced by a generic hint. */
+const isEnglishDefault = (message: string) => /^(invalid|too (big|small)|expected|unrecognized)/i.test(message)
+
+function fieldErrors(body: ErrorBody | null): FieldError[] {
+  return (body?.fields ?? []).map((field) => {
+    const path = typeof field.path === 'string' ? field.path.split('.')[0] : ''
+    const message = typeof field.message === 'string' && field.message && !isEnglishDefault(field.message) ? field.message : 'Valoare invalidă'
+    return { path, label: fieldLabels[path] ?? '', message }
+  })
+}
+
+function messageForStatus(status: number, body: ErrorBody | null, fields: FieldError[]) {
   const serverMessage = typeof body?.error === 'string' ? body.error : ''
   if (status === 401 || status === 403) return 'Sesiunea Telegram a expirat. Închide și redeschide Mini App-ul din bot.'
   if (status === 400) {
-    const labels = [...new Set((body?.fields ?? []).map((field) => fieldLabels[field.path?.split('.')[0] ?? '']).filter(Boolean))]
-    return labels.length ? `Date invalide: verifică ${labels.join(', ')}.` : 'Datele introduse nu sunt valide.'
+    const describe = ({ label, message }: FieldError) => !label || message.toLowerCase().startsWith(label) ? message : `${label}: ${message.charAt(0).toLowerCase()}${message.slice(1)}`
+    const details = [...new Set(fields.map(describe))]
+    return details.length ? `Date invalide — ${details.join('; ')}.` : 'Datele introduse nu sunt valide.'
   }
   if (status === 413) return 'Datele trimise sunt prea mari.'
   if (status === 429) return 'Prea multe cereri. Așteaptă puțin și încearcă din nou.'
@@ -58,7 +75,8 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     const body = await response.json().catch(() => null) as ErrorBody | null
-    throw new ApiError(messageForStatus(response.status, body), response.status)
+    const fields = response.status === 400 ? fieldErrors(body) : []
+    throw new ApiError(messageForStatus(response.status, body, fields), response.status, fields)
   }
   if (response.status === 204) return undefined as T
   try {
@@ -75,15 +93,20 @@ export function errorMessage(error: unknown, fallback: string) {
 
 type ApiLesson = { id: number, role: Role, title: string, groupName: string | null, teacherName: string | null, room: string | null, weekday: number, startTime: string, endTime: string, weekKind: 'odd' | 'even' | 'every', reminderMinutes: number, notificationsEnabled?: boolean | number }
 
+/** Lessons from older app versions may carry unexpected values; normalising keeps them visible in the right schedule. */
 const fromApi = (item: ApiLesson): Lesson => ({
-  id: String(item.id), role: item.role, title: item.title, group: item.groupName ?? '', teacher: item.teacherName ?? undefined, room: item.room ?? '—',
-  weekday: item.weekday - 1, startTime: item.startTime, endTime: item.endTime, weekType: item.weekKind === 'every' ? 'both' : item.weekKind, reminderMinutes: item.reminderMinutes,
+  id: String(item.id), role: item.role === 'teacher' ? 'teacher' : 'student', title: item.title, group: item.groupName ?? '', teacher: item.teacherName ?? undefined, room: item.room ?? '—',
+  weekday: Math.min(Math.max(Number(item.weekday) - 1, 0), 6), startTime: normalizeTime(item.startTime) || item.startTime, endTime: normalizeTime(item.endTime) || item.endTime,
+  weekType: item.weekKind === 'odd' || item.weekKind === 'even' ? item.weekKind : 'both', reminderMinutes: Number.isInteger(item.reminderMinutes) ? item.reminderMinutes : 15,
   notificationsEnabled: item.notificationsEnabled === undefined ? true : Boolean(item.notificationsEnabled),
 })
 
+/** Pasted text may contain tabs or line breaks, which the backend rejects. */
+const cleanText = (value: string | undefined) => (value ?? '').replace(/\p{Cc}+/gu, ' ').trim()
+
 const toApi = (lesson: Lesson) => JSON.stringify({
-  role: lesson.role, title: lesson.title.trim(), groupName: lesson.group.trim() || null, teacherName: lesson.teacher?.trim() || null,
-  room: lesson.room === '—' ? null : lesson.room.trim() || null, weekday: lesson.weekday + 1, startTime: lesson.startTime, endTime: lesson.endTime,
+  role: lesson.role, title: cleanText(lesson.title), groupName: cleanText(lesson.group) || null, teacherName: cleanText(lesson.teacher) || null,
+  room: lesson.room === '—' ? null : cleanText(lesson.room) || null, weekday: lesson.weekday + 1, startTime: normalizeTime(lesson.startTime) || lesson.startTime, endTime: normalizeTime(lesson.endTime) || lesson.endTime,
   weekKind: lesson.weekType === 'both' ? 'every' : lesson.weekType, reminderMinutes: lesson.reminderMinutes, notificationsEnabled: lesson.notificationsEnabled,
 })
 
@@ -106,15 +129,21 @@ export async function loadAccount() {
 export async function saveLessonRemote(lesson: Lesson) {
   return fromApi(await request<ApiLesson>('/api/lessons', { method: 'POST', body: toApi(lesson) }))
 }
-export async function updateLessonRemote(lesson: Lesson) {
-  return fromApi(await request<ApiLesson>(`/api/lessons/${encodeURIComponent(lesson.id)}`, { method: 'PUT', body: toApi(lesson) }))
+/** Only ids issued by the server can be updated or deleted; local ids never reach the API. */
+const serverId = (id: string) => {
+  if (!/^\d+$/.test(id)) throw new ApiError('Ora nu a fost încă salvată pe server. Închide editorul și adaug-o din nou.', 0)
+  return id
 }
-export const deleteLessonRemote = (id: string) => request<void>(`/api/lessons/${encodeURIComponent(id)}`, { method: 'DELETE' })
+export async function updateLessonRemote(lesson: Lesson) {
+  return fromApi(await request<ApiLesson>(`/api/lessons/${serverId(lesson.id)}`, { method: 'PUT', body: toApi(lesson) }))
+}
+export const deleteLessonRemote = async (id: string) => request<void>(`/api/lessons/${serverId(id)}`, { method: 'DELETE' })
 
 export const updateRole = (role: Role) => request<ApiProfile>('/api/me', { method: 'PATCH', body: JSON.stringify({ role }) })
 export const updateProfileState = (change: Partial<Pick<AccountProfile, 'studentEnabled' | 'teacherEnabled'>>) =>
   request<ApiProfile>('/api/me', { method: 'PATCH', body: JSON.stringify(change) })
-export const markNotificationsRead = () => request<void>('/api/notifications/read', { method: 'PATCH' })
+/** Marks as read the notifications of one schedule plus the general ones. */
+export const markNotificationsRead = (role: Role) => request<void>('/api/notifications/read', { method: 'PATCH', body: JSON.stringify({ role }) })
 
 export type TeacherGroup = { id: string, name: string, subject?: string | null, student_count: number }
 export type TeacherStudent = { id: string, first_name: string, last_name: string }
