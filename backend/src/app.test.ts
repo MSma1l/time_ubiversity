@@ -151,3 +151,37 @@ describe("HTTP API", () => {
     expect(last).toBe(429);
   });
 });
+
+describe("HTTP API profile rules", () => {
+  const patch = async (body: object, user: string) => {
+    const response = await api("/api/me", { method: "PATCH", body: JSON.stringify(body) }, user);
+    return { status: response.status, body: await response.json() };
+  };
+
+  it("keeps at least one mode enabled and the active role an enabled mode", async () => {
+    const user = "8008";
+    expect((await patch({ teacherEnabled: false }, user)).body).toMatchObject({ role: "student", studentEnabled: true, teacherEnabled: false });
+    // Selecting a disabled mode is refused and nothing changes.
+    expect(await patch({ role: "teacher" }, user)).toEqual({ status: 409, body: { error: "Modul Profesor este dezactivat. Activează-l mai întâi." } });
+    expect(await patch({ studentEnabled: false }, user)).toEqual({ status: 409, body: { error: "Cel puțin un mod trebuie să rămână activ." } });
+    expect(await patch({ role: "student", studentEnabled: false, teacherEnabled: true }, user)).toEqual({ status: 409, body: { error: "Modul Student este dezactivat. Activează-l mai întâi." } });
+    expect((await (await api("/api/me", {}, user)).json()).profile).toMatchObject({ role: "student", studentEnabled: true, teacherEnabled: false });
+    // Enabling and selecting in one request is allowed.
+    expect(await patch({ role: "teacher", teacherEnabled: true }, user)).toMatchObject({ status: 200, body: { role: "teacher", teacherEnabled: true } });
+  });
+
+  it("switches the active role when its mode is disabled while the other is enabled", async () => {
+    const user = "8009";
+    expect(await patch({ role: "teacher" }, user)).toMatchObject({ status: 200, body: { role: "teacher" } });
+    expect(await patch({ teacherEnabled: false }, user)).toMatchObject({ status: 200, body: { role: "student", studentEnabled: true, teacherEnabled: false } });
+    expect(await patch({ teacherEnabled: true, studentEnabled: false }, user)).toMatchObject({ status: 200, body: { role: "teacher", studentEnabled: false, teacherEnabled: true } });
+  });
+
+  it("exposes and updates remindersEnabled", async () => {
+    const user = "8010";
+    expect((await (await api("/api/me", {}, user)).json()).profile.remindersEnabled).toBe(true);
+    expect(await patch({ remindersEnabled: false }, user)).toMatchObject({ status: 200, body: { remindersEnabled: false, role: "student" } });
+    expect((await (await api("/api/me", {}, user)).json()).profile.remindersEnabled).toBe(false);
+    expect((await patch({ remindersEnabled: "no" }, user)).status).toBe(400);
+  });
+});

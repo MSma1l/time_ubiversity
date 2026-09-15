@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { botReply, pollingBackoff } from "./bot.js";
+import { afterEach, vi } from "vitest";
+import { BOT_COMMANDS, botReply, pollingBackoff, registerBotCommands } from "./bot.js";
+import { loadConfig } from "./config.js";
 import { openDatabase } from "./db.js";
 import { TelegramApiError } from "./telegram.js";
 
@@ -7,11 +9,15 @@ const NOW = new Date("2026-09-14T06:00:00Z"); // Monday, odd week
 const message = (text: string, chatType = "private") => ({ text, chat: { id: 42, type: chatType }, from: { id: 42, first_name: "Ion" } });
 
 describe("botReply", () => {
-  it("answers commands in private chats and ignores groups, bots and plain text", () => {
+  it("answers commands in private chats, helps on free text and ignores groups and bots", () => {
     const db = openDatabase(":memory:");
     expect(botReply(db, message("/start"), NOW)?.text).toContain("/azi");
+    expect(botReply(db, message("/start"), NOW)?.text).toContain("Orar Univer");
+    expect(botReply(db, message("/start"), NOW)?.text).not.toContain("UTM");
     expect(botReply(db, message("/start", "group"), NOW)).toBeNull();
-    expect(botReply(db, message("hello"), NOW)).toBeNull();
+    expect(botReply(db, message("hello"), NOW)?.text).toContain("/help");
+    expect(botReply(db, message("hello", "group"), NOW)).toBeNull();
+    expect(botReply(db, message("   "), NOW)).toBeNull();
     expect(botReply(db, { ...message("/start"), from: { id: 42, first_name: "Bot", is_bot: true } }, NOW)).toBeNull();
     expect(botReply(db, undefined, NOW)).toBeNull();
   });
@@ -28,8 +34,14 @@ describe("botReply", () => {
     expect(today).not.toContain("Altcineva");
     botReply(db, message("/rol profesor"), NOW);
     expect(db.prepare("SELECT role FROM profiles WHERE telegram_id=42").get()).toEqual({ role: "teacher" });
+    db.prepare("UPDATE lessons SET notifications_enabled=0 WHERE title='Chimie'").run();
     botReply(db, message("/notificari off"), NOW);
-    expect(db.prepare("SELECT COUNT(*) AS c FROM lessons WHERE notifications_enabled=1").get()).toEqual({ c: 1 });
+    // Only the profile flag changes; per-lesson settings are untouched.
+    expect(db.prepare("SELECT reminders_enabled AS r FROM profiles WHERE telegram_id=42").get()).toEqual({ r: 0 });
+    expect(db.prepare("SELECT title FROM lessons WHERE notifications_enabled=1 ORDER BY title").all()).toEqual([{ title: "Altcineva" }, { title: "Fizică" }]);
+    botReply(db, message("/notificari on"), NOW);
+    expect(db.prepare("SELECT reminders_enabled AS r FROM profiles WHERE telegram_id=42").get()).toEqual({ r: 1 });
+    expect(db.prepare("SELECT title FROM lessons WHERE notifications_enabled=1 ORDER BY title").all()).toEqual([{ title: "Altcineva" }, { title: "Fizică" }]);
   });
 });
 
@@ -47,6 +59,51 @@ describe("botReply schedules", () => {
     expect(teacher).toContain("Profesor");
     expect(teacher).toContain("Rețele");
     expect(teacher).not.toContain("Fizică");
+  });
+});
+
+describe("botReply usage and profile rules", () => {
+  it("explains /rol and /notificari usage when the argument is missing or invalid", () => {
+    const db = openDatabase(":memory:");
+    for (const text of ["/rol", "/rol admin"]) {
+      const answer = botReply(db, message(text), NOW)?.text ?? "";
+      expect(answer).toContain("/rol student");
+      expect(answer).not.toContain("Nu cunosc");
+    }
+    for (const text of ["/notificari", "/notificari maybe"]) {
+      const answer = botReply(db, message(text), NOW)?.text ?? "";
+      expect(answer).toContain("/notificari on");
+      expect(answer).not.toContain("Nu cunosc");
+    }
+    expect(botReply(db, message("/nimic"), NOW)?.text).toContain("Nu cunosc");
+  });
+
+  it("refuses /rol for a disabled mode and keeps the active role", () => {
+    const db = openDatabase(":memory:");
+    botReply(db, message("/start"), NOW);
+    db.prepare("UPDATE profiles SET teacher_enabled=0 WHERE telegram_id=42").run();
+    expect(botReply(db, message("/rol profesor"), NOW)?.text).toContain("Modul Profesor este dezactivat. Activează-l mai întâi.");
+    expect(db.prepare("SELECT role FROM profiles WHERE telegram_id=42").get()).toEqual({ role: "student" });
+    expect(botReply(db, message("/rol student"), NOW)?.text).toContain("Mod activ: Student");
+  });
+});
+
+describe("registerBotCommands", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  it("registers Romanian commands once when a token is set and ignores failures", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const silent = { warn: () => undefined };
+    expect(await registerBotCommands(loadConfig({}), undefined, silent)).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const config = loadConfig({ TELEGRAM_BOT_TOKEN: "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw1" });
+    expect(await registerBotCommands(config, undefined, silent)).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toMatch(/\/setMyCommands$/);
+    expect(JSON.parse(String(init.body)).commands).toEqual(BOT_COMMANDS);
+    fetchMock.mockImplementationOnce(async () => new Response(JSON.stringify({ ok: false, description: "bad" }), { status: 400 }));
+    expect(await registerBotCommands(config, undefined, silent)).toBe(false);
   });
 });
 

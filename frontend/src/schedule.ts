@@ -34,7 +34,21 @@ const clockFormatter = new Intl.DateTimeFormat('en-GB', {
 
 const noonUtc = (isoDate: string) => new Date(`${isoDate}T12:00:00Z`)
 
-export function universityClock(date = new Date()): UniversityClock {
+/**
+ * Dev-only clock override for manual testing, e.g. `?now=2026-09-20T23:58:00%2B03:00`. The clock keeps ticking from that instant.
+ * `import.meta.env.DEV` is false in production builds, so the override is removed there.
+ */
+const devClockOffsetMs = (() => {
+  if (!import.meta.env?.DEV || typeof window === 'undefined') return 0
+  const value = new URLSearchParams(window.location.search).get('now')
+  const time = value ? new Date(value).getTime() : Number.NaN
+  return Number.isNaN(time) ? 0 : time - Date.now()
+})()
+
+/** Current instant (honours the dev clock override). */
+export const currentInstant = () => new Date(Date.now() + devClockOffsetMs)
+
+export function universityClock(date = currentInstant()): UniversityClock {
   const parts = clockFormatter.formatToParts(date)
   const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? '00'
   const isoDate = `${value('year')}-${value('month')}-${value('day')}`
@@ -52,6 +66,21 @@ export function addDays(isoDate: string, days: number) {
 export function formatDayMonth(isoDate: string) {
   return noonUtc(isoDate).toLocaleDateString('ro-RO', { timeZone: 'UTC', day: 'numeric', month: 'long' })
 }
+
+/** Monday (`YYYY-MM-DD`) of the week `weekOffset` weeks away from the week containing `isoDate`. */
+export function mondayOf(isoDate: string, weekOffset = 0) {
+  return addDays(isoDate, weekOffset * 7 - weekdayIndexOf(isoDate))
+}
+
+/** "7–13 septembrie", or "28 sept. – 4 oct." when the week spans two months. */
+export function formatWeekRange(monday: string) {
+  const sunday = addDays(monday, 6)
+  const month = (isoDate: string, style: 'long' | 'short') => noonUtc(isoDate).toLocaleDateString('ro-RO', { timeZone: 'UTC', month: style })
+  if (monday.slice(0, 7) === sunday.slice(0, 7)) return `${dayOfMonth(monday)}–${dayOfMonth(sunday)} ${month(monday, 'long')}`
+  return `${dayOfMonth(monday)} ${month(monday, 'short')} – ${dayOfMonth(sunday)} ${month(sunday, 'short')}`
+}
+
+export const weekTypeLabels: Record<WeekType, string> = { even: 'pară', odd: 'impară' }
 
 export function dayOfMonth(isoDate: string) {
   return Number(isoDate.slice(8, 10))

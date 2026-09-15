@@ -1,5 +1,6 @@
+import { useState } from 'react'
 import { useDialog } from '../dialogs'
-import { formatServerDate, lessonMatchesWeek, teachingDays, timeToMinutes, weekdayNames } from '../schedule'
+import { formatServerDate, formatWeekRange, lessonMatchesWeek, teachingDays, timeToMinutes, weekdayNames, weekTypeFor, weekTypeLabels } from '../schedule'
 import { initialOf, roleLabels } from '../labels'
 import type { AppNotification, Lesson, Role, WeekType } from '../types'
 
@@ -32,29 +33,62 @@ const slotIndexFor = (time: string) => {
 }
 const shortWeek: Record<Lesson['weekType'], string> = { both: 'ambele', even: 'pară', odd: 'impară' }
 
-type CalendarProps = { lessons: Lesson[], role: Role, week: WeekType, onClose(): void, onAdd(day: number, time: string): void, onEdit(lesson: Lesson): void }
+type WeekNavProps = { start: string, offset: number, onShift(delta: number): void, onReset(): void, resetVisible?: boolean }
 
-export function CalendarPanel({ lessons, role, week, onClose, onAdd, onEdit }: CalendarProps) {
+/** ‹ week range + parity › with a reset to the current week. Compact enough for a 390px screen. */
+export function WeekNav({ start, offset, onShift, onReset, resetVisible = offset !== 0 }: WeekNavProps) {
+  const parity = weekTypeFor(start)
+  const relative = offset === 0 ? 'Săptămâna curentă' : offset === 1 ? 'Săptămâna viitoare' : offset === -1 ? 'Săptămâna trecută' : offset > 0 ? `Peste ${offset} săptămâni` : `Acum ${-offset} săptămâni`
+  return <div className="week-nav" role="group" aria-label="Alege săptămâna">
+    <button type="button" className="week-nav-arrow" onClick={() => onShift(-1)} aria-label="Săptămâna anterioară">‹</button>
+    <div className="week-nav-label" aria-live="polite">
+      <b>{formatWeekRange(start)}</b>
+      <small><span className={`week-chip ${parity}`}>{weekTypeLabels[parity]}</span>{relative}</small>
+    </div>
+    {resetVisible && <button type="button" className="week-nav-reset" onClick={onReset} aria-label="Înapoi la ziua de azi">Azi</button>}
+    <button type="button" className="week-nav-arrow" onClick={() => onShift(1)} aria-label="Săptămâna următoare">›</button>
+  </div>
+}
+
+type CalendarProps = {
+  lessons: Lesson[], role: Role, weekStart: string, weekOffset: number,
+  onShiftWeek(delta: number): void, onResetWeek(): void, onClose(): void, onAdd(day: number, time: string): void, onEdit(lesson: Lesson): void,
+}
+
+export function CalendarPanel({ lessons, role, weekStart, weekOffset, onShiftWeek, onResetWeek, onClose, onAdd, onEdit }: CalendarProps) {
   const dialogRef = useDialog<HTMLElement>(onClose)
-  const visible = lessons.filter((lesson) => lesson.role === role && lessonMatchesWeek(lesson, week))
-  // Sunday gets a column only when it actually has lessons this week.
+  /** Off: only the displayed week's lessons. On: every lesson of the role; the other parity is dimmed but still editable. */
+  const [showAll, setShowAll] = useState(false)
+  const week = weekTypeFor(weekStart)
+  const roleLessons = lessons.filter((lesson) => lesson.role === role)
+  const visible = showAll ? roleLessons : roleLessons.filter((lesson) => lessonMatchesWeek(lesson, week))
+  const hiddenCount = roleLessons.length - roleLessons.filter((lesson) => lessonMatchesWeek(lesson, week)).length
+  // Sunday gets a column only when it actually has visible lessons.
   const hasSunday = visible.some((lesson) => lesson.weekday === weekdayNames.length - 1)
   const days = hasSunday ? weekdayNames : teachingDays
   const cells = new Map<string, Lesson[]>()
+  // This week's lessons first, then by start time.
+  const order = (a: Lesson, b: Lesson) => Number(!lessonMatchesWeek(a, week)) - Number(!lessonMatchesWeek(b, week)) || a.startTime.localeCompare(b.startTime)
   for (const lesson of visible) {
     if (lesson.weekday < 0 || lesson.weekday >= days.length) continue
     const key = `${lesson.weekday}-${slotIndexFor(lesson.startTime)}`
-    cells.set(key, [...(cells.get(key) ?? []), lesson].sort((a, b) => a.startTime.localeCompare(b.startTime)))
+    cells.set(key, [...(cells.get(key) ?? []), lesson].sort(order))
   }
   const roleName = roleLabels[role]
 
   return <div className="modal-backdrop calendar-backdrop" role="presentation">
     <section ref={dialogRef} className="calendar-panel" role="dialog" aria-modal="true" aria-labelledby="calendar-title" tabIndex={-1}>
       <div className="modal-heading">
-        <div><p>ORAR {roleName.toUpperCase()} · SĂPTĂMÂNA {week === 'even' ? 'PARĂ' : 'IMPARĂ'}</p><h2 id="calendar-title">Calendarul orelor</h2></div>
+        <div><p>ORAR {roleName.toUpperCase()} · SĂPTĂMÂNA {weekTypeLabels[week].toUpperCase()}</p><h2 id="calendar-title">Calendarul orelor</h2></div>
         <button type="button" onClick={onClose} aria-label="Închide">×</button>
       </div>
-      <p className="calendar-hint">Acesta este orarul de {roleName}. Adaugi și editezi doar orele acestui rol.</p>
+      <div className="calendar-toolbar"><WeekNav start={weekStart} offset={weekOffset} onShift={onShiftWeek} onReset={onResetWeek} /></div>
+      <div className="calendar-hint-row">
+        <p className="calendar-hint">Orarul de {roleName}. {showAll ? `Orele doar din săptămâna ${weekTypeLabels[week === 'even' ? 'odd' : 'even']} sunt estompate și pot fi editate.` : 'Doar orele din această săptămână.'}</p>
+        <button type="button" className={`calendar-toggle ${showAll ? 'on' : ''}`} aria-pressed={showAll} onClick={() => setShowAll((value) => !value)}>
+          Toate orele{!showAll && hiddenCount > 0 ? ` (+${hiddenCount})` : ''}
+        </button>
+      </div>
       <div className={`calendar-grid ${hasSunday ? 'with-sunday' : ''}`}>
         <div className="calendar-head time-head">Ora</div>
         {days.map((day) => <div className="calendar-head" key={day}>{day.slice(0, 2)}</div>)}
@@ -62,11 +96,16 @@ export function CalendarPanel({ lessons, role, week, onClose, onAdd, onEdit }: C
           <div className="time-label" key={`${time}-label`}>{time}</div>,
           ...days.map((dayName, day) => {
             const items = cells.get(`${day}-${slot}`) ?? []
-            const item = items[0]
-            return <button type="button" className={`calendar-cell ${item ? 'occupied' : ''}`} key={`${day}-${time}`} onClick={() => item ? onEdit(item) : onAdd(day, time)}
-              aria-label={item ? `Editează ${item.title}, ${dayName} ${item.startTime}` : `Adaugă o oră ${dayName} la ${time}`}>
-              {item ? <><b>{item.title}</b><small>{item.startTime !== time ? `${item.startTime} · ` : ''}{item.room}</small><em>{shortWeek[item.weekType]}{items.length > 1 ? ` +${items.length - 1}` : ''}</em></> : <span aria-hidden="true">+</span>}
-            </button>
+            if (!items.length) return <button type="button" className="calendar-cell" key={`${day}-${time}`} onClick={() => onAdd(day, time)} aria-label={`Adaugă o oră ${dayName} la ${time}`}><span aria-hidden="true">+</span></button>
+            return <div className="calendar-cell occupied" key={`${day}-${time}`}>
+              {items.map((item) => {
+                const inWeek = lessonMatchesWeek(item, week)
+                return <button type="button" key={item.id} className={`calendar-lesson ${inWeek ? '' : 'other-week'}`} onClick={() => onEdit(item)}
+                  aria-label={`Editează ${item.title}, ${dayName} ${item.startTime}, ${shortWeek[item.weekType]}${inWeek ? '' : ' (nu în această săptămână)'}`}>
+                  <b>{item.title}</b><small>{item.startTime !== time ? `${item.startTime} · ` : ''}{item.room}</small><em>{shortWeek[item.weekType]}</em>
+                </button>
+              })}
+            </div>
           }),
         ])}
       </div>
@@ -76,25 +115,28 @@ export function CalendarPanel({ lessons, role, week, onClose, onAdd, onEdit }: C
 
 type ProfileProps = {
   name: string, role: Role, week: WeekType, enabled: Record<Role, boolean>, synced: boolean,
+  /** Why the last role/mode change failed; shown here because the page notice is hidden behind the panel. */
+  error?: string,
   onClose(): void, onSwitchRole(): void, onToggle(role: Role): void, onOpenGroupSettings(): void,
 }
 
-export function ProfilePanel({ name, role, week, enabled, synced, onClose, onSwitchRole, onToggle, onOpenGroupSettings }: ProfileProps) {
+export function ProfilePanel({ name, role, week, enabled, synced, error, onClose, onSwitchRole, onToggle, onOpenGroupSettings }: ProfileProps) {
   const dialogRef = useDialog<HTMLElement>(onClose)
   return <div className="modal-backdrop" role="presentation">
     <section ref={dialogRef} className="notification-panel profile-panel" role="dialog" aria-modal="true" aria-labelledby="profile-title" tabIndex={-1}>
       <div className="modal-heading">
-        <div><p>CONTUL MEU · TELEGRAM</p><h2 id="profile-title">Profil UTM</h2></div>
+        <div><p>ORAR UNIVER · TELEGRAM</p><h2 id="profile-title">Profilul meu</h2></div>
         <button type="button" onClick={onClose} aria-label="Închide">×</button>
       </div>
       <div className="profile-hero"><span aria-hidden="true">{initialOf(name)}</span><div><h3>{name || 'Utilizator'}</h3><p>{synced ? 'Conectat automat prin Telegram' : 'Neconectat — datele nu se sincronizează'}</p></div></div>
+      {error && <p className="error-notice profile-error" role="alert">⚠ {error}</p>}
       <div className="profile-setting"><div><strong>Rol activ</strong><p>{roleLabels[role]}</p></div><button type="button" onClick={onSwitchRole}>Schimbă rolul</button></div>
       {(['student', 'teacher'] as const).map((kind) => <div className="profile-setting" key={kind}>
         <div><strong>Mod {roleLabels[kind]}</strong><p>{enabled[kind] ? (kind === 'student' ? 'Activ — vezi orele tale' : 'Activ — gestionezi orele') : 'Dezactivat'}</p></div>
         <button type="button" className={`status-toggle ${enabled[kind] ? 'on' : ''}`} onClick={() => onToggle(kind)} aria-pressed={enabled[kind]} aria-label={`Mod ${roleLabels[kind]}`}><i /></button>
       </div>)}
       {role === 'teacher' && <button type="button" className="profile-setting group-settings-link" onClick={onOpenGroupSettings}><span className="setting-icon" aria-hidden="true">⚙</span><div><strong>Setări grupe</strong><p>Grupe, studenți, prezență și note</p></div><span aria-hidden="true">›</span></button>}
-      <div className="profile-setting"><div><strong>Paritatea săptămânii</strong><p>Calcul automat: {week === 'even' ? 'pară' : 'impară'}</p></div><span className="auto-dot">AUTO</span></div>
+      <div className="profile-setting"><div><strong>Paritatea săptămânii</strong><p>Calcul automat: săptămâna aceasta este {weekTypeLabels[week]}</p></div><span className="auto-dot">AUTO</span></div>
       <p className="profile-note">Profilul este al contului Telegram cu care ai deschis Mini App-ul. Când redeschizi aplicația, sesiunea se validează automat pe server, iar datele tale rămân separate de ale altor utilizatori.</p>
     </section>
   </div>

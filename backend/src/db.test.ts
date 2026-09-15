@@ -56,4 +56,22 @@ describe("openDatabase migrations", () => {
     db.close();
     expect(lessonRows(openDatabase(path), 2)).toMatchObject([{ role: "teacher", weekKind: "every" }]);
   });
+
+  it("repairs profiles that violate the mode rules and adds reminders_enabled", () => {
+    const path = tempDatabasePath();
+    const legacy = new Database(path);
+    legacy.exec(`CREATE TABLE profiles (telegram_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'student', timezone TEXT NOT NULL DEFAULT 'Europe/Chisinau', student_enabled INTEGER NOT NULL DEFAULT 1, teacher_enabled INTEGER NOT NULL DEFAULT 1);
+      INSERT INTO profiles (telegram_id, display_name, role, student_enabled, teacher_enabled) VALUES
+        (1, 'Both off', 'teacher', 0, 0), (2, 'Teacher off', 'teacher', 1, 0), (3, 'Student off', 'student', 0, 1), (4, 'Valid', 'teacher', 0, 1);`);
+    legacy.close();
+
+    const db = openDatabase(path);
+    expect(db.prepare("SELECT telegram_id AS id, role, student_enabled AS s, teacher_enabled AS t, reminders_enabled AS r FROM profiles ORDER BY telegram_id").all()).toEqual([
+      { id: 1, role: "student", s: 1, t: 0, r: 1 },
+      { id: 2, role: "student", s: 1, t: 0, r: 1 },
+      { id: 3, role: "teacher", s: 0, t: 1, r: 1 },
+      { id: 4, role: "teacher", s: 0, t: 1, r: 1 }
+    ]);
+    db.close();
+  });
 });

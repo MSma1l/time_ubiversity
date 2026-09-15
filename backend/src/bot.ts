@@ -1,5 +1,6 @@
 import { miniAppButton, type AppConfig } from "./config.js";
 import { lessonRows, upsertProfile, type Lesson, type SqliteDatabase } from "./db.js";
+import { ProfileRuleError, readProfile, updateProfile } from "./profile.js";
 import { appliesInWeek, chisinauClock, universityWeekKind } from "./schedule.js";
 import { sleep } from "./util.js";
 import { deriveWebhookSecret, telegramApi, telegramApiResponse, TelegramApiError, type TelegramUser } from "./telegram.js";
@@ -9,47 +10,70 @@ export type TelegramUpdate = { update_id: number, message?: TelegramMessage };
 
 const ROLE_NAMES: Record<Lesson["role"], string> = { student: "Student", teacher: "Profesor" };
 
-/** The schedule the bot shows is the one of the profile's active role (as in the Mini App). */
-function activeRole(db: SqliteDatabase, userId: number): Lesson["role"] {
-  const profile = db.prepare("SELECT role FROM profiles WHERE telegram_id=?").get(userId) as { role?: string } | undefined;
-  return profile?.role === "teacher" ? "teacher" : "student";
-}
+/** Canonical product name (frontend/index.html <title>). */
+export const APP_NAME = "Orar Univer";
+
+/** Command menu registered with Telegram via setMyCommands. */
+export const BOT_COMMANDS = [
+  { command: "azi", description: "Orarul de azi" },
+  { command: "saptamana", description: "Orarul săptămânii curente" },
+  { command: "rol", description: "Schimbă modul: student sau profesor" },
+  { command: "notificari", description: "Pornește sau oprește memento-urile" },
+  { command: "status", description: "Starea contului" },
+  { command: "help", description: "Lista comenzilor" }
+] as const;
+
+const HELP_TEXT = `Bun venit la ${APP_NAME}!\n\n/azi — orarul de azi\n/saptamana — orarul săptămânii curente\n/rol student|profesor — schimbă modul activ\n/notificari on|off — pornește/oprește memento-urile\n/status — starea contului`;
+const FREE_TEXT_REPLY = `Sunt botul ${APP_NAME} și răspund doar la comenzi. Trimite /help pentru lista comenzilor sau deschide orarul în aplicație.`;
+const ROLE_ARGUMENTS: Record<string, Lesson["role"]> = { student: "student", profesor: "teacher", teacher: "teacher" };
 
 function formatLesson(lesson: Lesson) { return `• ${lesson.startTime}–${lesson.endTime} — ${lesson.title}${lesson.room ? ` (sala ${lesson.room})` : ""}`; }
 
 /**
  * Computes the bot's answer and applies command side effects. Data is always keyed by the
  * sender (`from.id`); only private chats are handled so personal schedules are never posted
- * into groups.
+ * into groups. Free text in a private chat gets a short help reply.
  */
 export function botReply(db: SqliteDatabase, message: TelegramMessage | undefined, now = new Date()): { chatId: number, text: string } | null {
   const chatId = message?.chat?.id; const from = message?.from; const text = message?.text?.trim() ?? "";
-  if (!message || !chatId || !from || from.is_bot || !Number.isSafeInteger(from.id) || message.chat?.type !== "private" || !text.startsWith("/")) return null;
+  if (!message || !chatId || !from || from.is_bot || !Number.isSafeInteger(from.id) || message.chat?.type !== "private" || !text) return null;
+  if (!text.startsWith("/")) return { chatId, text: FREE_TEXT_REPLY };
   const userId = from.id;
   const words = text.split(/\s+/);
   const command = words[0].split("@")[0].toLowerCase(); const argument = words.slice(1).join(" ").toLowerCase();
   upsertProfile(db, { id: userId, first_name: typeof from.first_name === "string" ? from.first_name : "", last_name: typeof from.last_name === "string" ? from.last_name : undefined });
+  const profile = readProfile(db, userId);
+  // The schedule the bot shows is the one of the profile's active role (as in the Mini App).
+  const role: Lesson["role"] = profile?.role === "teacher" ? "teacher" : "student";
   const clock = chisinauClock(now); const kind = universityWeekKind(clock.date);
   const kindLabel = kind === "even" ? "pară" : "impară";
   let answer = "";
-  if (command === "/start" || command === "/help") answer = "Bun venit la Orar UTM!\n\n/azi — orarul de azi\n/saptamana — orarul săptămânii curente\n/rol student|profesor — schimbă rolul\n/notificari on|off — activează/dezactivează memento-urile\n/status — starea contului";
+  if (command === "/start" || command === "/help") answer = HELP_TEXT;
   else if (command === "/azi") {
-    const role = activeRole(db, userId);
     const todayLessons = lessonRows(db, userId, role).filter((lesson) => lesson.weekday === clock.weekday && appliesInWeek(lesson.weekKind, clock.date));
     answer = todayLessons.length ? `📚 Orarul de azi · ${ROLE_NAMES[role]} (săptămână ${kindLabel}):\n${todayLessons.map(formatLesson).join("\n")}` : `☀️ Ești liber azi — nu ai nicio pereche programată în orarul de ${ROLE_NAMES[role]}.`;
   } else if (command === "/saptamana") {
-    const role = activeRole(db, userId);
     const entries = lessonRows(db, userId, role).filter((lesson) => appliesInWeek(lesson.weekKind, clock.date));
     answer = entries.length ? `📅 Săptămâna ${kindLabel} · ${ROLE_NAMES[role]}:\n${entries.map((lesson) => `${["Lu", "Ma", "Mi", "Jo", "Vi", "Sâ", "Du"][lesson.weekday - 1]} ${formatLesson(lesson)}`).join("\n")}` : `Nu ai ore în această săptămână în orarul de ${ROLE_NAMES[role]}.`;
-  } else if (command === "/rol" && (argument === "student" || argument === "profesor")) {
-    db.prepare("UPDATE profiles SET role=? WHERE telegram_id=?").run(argument === "profesor" ? "teacher" : "student", userId);
-    answer = `Rol activ: ${argument}.`;
-  } else if (command === "/notificari" && (argument === "on" || argument === "off")) {
-    db.prepare("UPDATE lessons SET notifications_enabled=?, updated_at=CURRENT_TIMESTAMP WHERE owner_id=?").run(argument === "on" ? 1 : 0, userId);
-    answer = argument === "on" ? "🔔 Memento-urile sunt active." : "🔕 Memento-urile sunt oprite.";
+  } else if (command === "/rol") {
+    const requested = ROLE_ARGUMENTS[argument];
+    if (!requested) answer = `Folosește: /rol student sau /rol profesor.\nMod activ: ${ROLE_NAMES[role]}.`;
+    else {
+      try {
+        answer = `Mod activ: ${ROLE_NAMES[updateProfile(db, userId, { role: requested }).role]}.`;
+      } catch (error) {
+        if (!(error instanceof ProfileRuleError)) throw error;
+        answer = `${error.message} Poți activa modurile din aplicație (Profil).`;
+      }
+    }
+  } else if (command === "/notificari") {
+    if (argument === "on" || argument === "off") {
+      updateProfile(db, userId, { remindersEnabled: argument === "on" });
+      answer = argument === "on" ? "🔔 Memento-urile sunt active." : "🔕 Memento-urile sunt oprite. Setările fiecărei ore rămân neschimbate.";
+    } else answer = `Folosește: /notificari on sau /notificari off.\nMemento-uri: ${profile?.remindersEnabled === false ? "oprite" : "active"}.`;
   } else if (command === "/status") {
-    const profile = db.prepare("SELECT role FROM profiles WHERE telegram_id=?").get(userId) as { role?: string } | undefined;
-    answer = `Cont activ · rol: ${profile?.role === "teacher" ? "profesor" : "student"} · săptămână ${kindLabel}.`;
+    const modes = [profile?.studentEnabled !== false && "Student", profile?.teacherEnabled !== false && "Profesor"].filter(Boolean).join(", ");
+    answer = `Cont activ · mod: ${ROLE_NAMES[role]} · moduri disponibile: ${modes} · memento-uri: ${profile?.remindersEnabled === false ? "oprite" : "active"} · săptămână ${kindLabel}.`;
   } else answer = "Nu cunosc această comandă. Trimite /help pentru lista comenzilor.";
   return { chatId, text: answer };
 }
@@ -59,6 +83,18 @@ export async function handleBotMessage(db: SqliteDatabase, config: AppConfig, me
   const reply = botReply(db, message);
   if (!reply) return;
   await telegramApi(config.token, "sendMessage", { chat_id: reply.chatId, text: reply.text, reply_markup: miniAppButton(config, "Deschide orarul") }, signal);
+}
+
+/** Registers the Romanian command menu once at startup. Failures are logged and ignored. */
+export async function registerBotCommands(config: AppConfig, signal?: AbortSignal, log: Pick<Console, "warn"> = console) {
+  if (!config.token) return false;
+  try {
+    await telegramApi(config.token, "setMyCommands", { commands: BOT_COMMANDS }, signal);
+    return true;
+  } catch (error) {
+    if (!signal?.aborted) log.warn("Telegram setMyCommands failed:", error instanceof Error ? error.message : error);
+    return false;
+  }
 }
 
 export function webhookSecret(config: AppConfig) {

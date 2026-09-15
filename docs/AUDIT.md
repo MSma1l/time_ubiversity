@@ -171,3 +171,17 @@ Verificat: scenariu UI în Chrome headless (dev auth) — creare/editare/șterge
 Profesor, 08:00/09:30/13:15/18:00, pară/impară/fiecare, câmpuri opționale goale, memento oprit,
 reîncărcare: toate persistă și rămân separate; DB creată cu schema veche se deschide cu orele
 vizibile în rolul corect. Teste backend: 52.
+
+## 7. Al treilea val de reparații
+
+| Zonă | Reparație |
+|---|---|
+| Săptămâni | Navigare ‹ › între săptămâni (dată + paritate), „Azi”; orele de paritate opusă se văd, se editează și se șterg; duminică „Lu” duce la ziua de mâine. |
+| Sesiune | Schimbarea rolului/modurilor cu sesiune expirată (401/409) se anulează și afișează eroarea; rolul activ nu poate fi un mod dezactivat. |
+| Profil (backend) | Regulă unică în `profile.ts` pentru API și bot: minim un mod activ, rolul doar pe un mod activ (409); migrare care repară profilele. |
+| Bot | `/notificari on/off` comută doar `reminders_enabled` din profil (nu mai suprascrie lecțiile); mesaje de utilizare; `setMyCommands`; numele „Orar Univer”. |
+| Memento-uri | Gramatică corectă („20 de minute”, „1 minut”) prin `labels.ts`. |
+| Catalog | GET prezență și note (se văd după redeschidere); notă unică per laborator (upsert); nume de grupă unice fără diferență de majuscule; redenumire/ștergere grupe și studenți; 503 când Postgres cade, 400 pentru date invalide; layout mobil cu tastatură. |
+| Notificări | Reîncărcate la deschiderea panoului și la revenirea în aplicație. |
+
+Teste backend: **65** trecute (+7 care rulează doar cu `DATABASE_URL_TEST`). Frontend: lint 0 warning-uri, build OK.

@@ -3,14 +3,15 @@ import express, { type NextFunction, type Request, type Response } from "express
 import helmet from "helmet";
 import type { Pool } from "pg";
 import { ZodError } from "zod";
-import { academicDatabase, academicHealth, ensureAcademicSchema } from "./academic.js";
+import { academicDatabase, academicHealth, ensureAcademicSchema, isConnectionError, resetAcademicSchema } from "./academic.js";
 import { handleBotMessage, webhookSecret } from "./bot.js";
 import type { AppConfig } from "./config.js";
 import { addNotification, lessonById, lessonRows, upsertProfile, type SqliteDatabase } from "./db.js";
+import { ProfileRuleError, readProfile, updateProfile } from "./profile.js";
 import { createRateLimiter, rateLimitMiddleware } from "./rateLimit.js";
 import { isoDateInChisinau, isValidIsoDate, SEMESTER_REFERENCE_KIND, SEMESTER_REFERENCE_MONDAY, universityWeekKind, universityWeekNumber } from "./schedule.js";
 import { safeEqual, validateInitData, type TelegramUser } from "./telegram.js";
-import { attendanceSchema, gradeSchema, groupSchema, lessonIdSchema, lessonSchema, lessonUpdateSchema, notificationsReadSchema, profilePatchSchema, studentSchema, uuidSchema } from "./validation.js";
+import { attendanceQuerySchema, attendanceSchema, gradeSchema, groupPatchSchema, groupSchema, lessonIdSchema, lessonSchema, lessonUpdateSchema, notificationsReadSchema, profilePatchSchema, studentPatchSchema, studentSchema, uuidSchema } from "./validation.js";
 
 export const LIMITS = { lessonsPerUser: 500, groupsPerTeacher: 200, studentsPerGroup: 500 };
 
@@ -21,12 +22,10 @@ class HttpError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
 }
 
-const PROFILE_COLUMNS = "telegram_id AS telegramId, display_name AS displayName, role, timezone, student_enabled AS studentEnabled, teacher_enabled AS teacherEnabled";
-type ProfileRow = { studentEnabled: number, teacherEnabled: number } & Record<string, unknown>;
-const toProfile = (row: ProfileRow | undefined) => row && { ...row, studentEnabled: Boolean(row.studentEnabled), teacherEnabled: Boolean(row.teacherEnabled) };
-
 const GROUP_NOT_FOUND = "Grupa nu a fost găsită";
 const STUDENT_NOT_FOUND = "Studentul nu a fost găsit";
+const CATALOG_UNAVAILABLE = "Catalogul Profesor nu se poate conecta încă la PostgreSQL. Așteaptă câteva secunde și reîncearcă.";
+const groupExists = (name: string) => `Ai deja o grupă cu numele „${name}” (literele mari și mici nu contează).`;
 
 export type AppDependencies = { db: SqliteDatabase, config: AppConfig, log?: Pick<Console, "error" | "warn"> };
 
@@ -81,7 +80,7 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     next();
   }
 
-  const profileOf = (id: number) => toProfile(db.prepare(`SELECT ${PROFILE_COLUMNS} FROM profiles WHERE telegram_id=?`).get(id) as ProfileRow | undefined);
+  const profileOf = (id: number) => readProfile(db, id);
 
   app.get("/api/me", auth, (req, res) => {
     const user = userOf(req);
@@ -89,13 +88,13 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   });
   app.patch("/api/me", auth, (req, res) => {
     const body = profilePatchSchema.parse(req.body);
-    const user = userOf(req);
-    db.transaction(() => {
-      if (body.role) db.prepare("UPDATE profiles SET role=? WHERE telegram_id=?").run(body.role, user.id);
-      if (body.studentEnabled !== undefined) db.prepare("UPDATE profiles SET student_enabled=? WHERE telegram_id=?").run(Number(body.studentEnabled), user.id);
-      if (body.teacherEnabled !== undefined) db.prepare("UPDATE profiles SET teacher_enabled=? WHERE telegram_id=?").run(Number(body.teacherEnabled), user.id);
-    })();
-    res.json(profileOf(user.id));
+    // Mode rules (profile.ts) are checked on the merged profile inside one transaction.
+    try {
+      res.json(updateProfile(db, userOf(req).id, body));
+    } catch (error) {
+      if (error instanceof ProfileRuleError) return res.status(409).json({ error: error.message });
+      throw error;
+    }
   });
   app.get("/api/week", auth, (req, res) => {
     const date = req.query.date;
@@ -166,7 +165,7 @@ export function createApp({ db, config, log = console }: AppDependencies) {
       return pg;
     } catch (error) {
       log.warn("PostgreSQL catalog unavailable:", error instanceof Error ? error.message : error);
-      res.status(503).json({ error: "Catalogul Profesor nu se poate conecta încă la PostgreSQL. Așteaptă câteva secunde și reîncearcă." });
+      res.status(503).json({ error: CATALOG_UNAVAILABLE });
       return undefined;
     }
   }
@@ -177,10 +176,18 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     if (!parsed.success) throw new HttpError(404, notFound);
     return parsed.data;
   };
+  /** Group names are unique per owner regardless of letter case (si-265 = SI-265). */
+  const assertGroupNameFree = async (pg: Pool, ownerId: number, name: string, exceptId?: string) => {
+    const clash = await pg.query("SELECT name FROM academic_groups WHERE owner_id=$1 AND lower(name)=lower($2) AND ($3::uuid IS NULL OR id<>$3::uuid) LIMIT 1", [ownerId, name, exceptId ?? null]);
+    if (clash.rowCount) throw new HttpError(409, groupExists(clash.rows[0].name));
+  };
+  const GROUP_COLUMNS = "g.id, g.owner_id, g.name, g.subject, g.created_at, (SELECT COUNT(*)::int FROM students s WHERE s.group_id=g.id) AS student_count";
+  const GRADE_COLUMNS = "id, student_id, laboratory, presented_on::text AS presented_on, grade::float8 AS grade, feedback, created_at";
 
   app.get("/api/teacher/groups", auth, async (req, res) => {
     const pg = await catalog(res); if (!pg) return;
-    const result = await pg.query("SELECT g.*, COUNT(s.id)::int AS student_count FROM academic_groups g LEFT JOIN students s ON s.group_id=g.id WHERE g.owner_id=$1 GROUP BY g.id ORDER BY g.name", [userOf(req).id]);
+    // Display order (Romanian collation) is applied by the client; the server order is only a stable default.
+    const result = await pg.query(`SELECT ${GROUP_COLUMNS} FROM academic_groups g WHERE g.owner_id=$1 ORDER BY lower(g.name), g.name`, [userOf(req).id]);
     res.json(result.rows);
   });
   app.post("/api/teacher/groups", auth, async (req, res) => {
@@ -188,8 +195,28 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     const pg = await catalog(res); if (!pg) return;
     const count = (await pg.query("SELECT COUNT(*)::int AS count FROM academic_groups WHERE owner_id=$1", [ownerId])).rows[0].count as number;
     if (count >= LIMITS.groupsPerTeacher) throw new HttpError(409, `Ai atins limita de ${LIMITS.groupsPerTeacher} grupe.`);
-    const result = await pg.query("INSERT INTO academic_groups(owner_id,name,subject) VALUES($1,$2,$3) RETURNING *, 0 AS student_count", [ownerId, input.name, input.subject]);
+    await assertGroupNameFree(pg, ownerId, input.name);
+    const result = await pg.query("INSERT INTO academic_groups(owner_id,name,subject) VALUES($1,$2,$3) RETURNING id, owner_id, name, subject, created_at, 0 AS student_count", [ownerId, input.name, input.subject]);
     res.status(201).json(result.rows[0]);
+  });
+  app.patch("/api/teacher/groups/:groupId", auth, async (req, res) => {
+    const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND); const input = groupPatchSchema.parse(req.body); const ownerId = userOf(req).id;
+    const pg = await catalog(res); if (!pg) return;
+    if (!await ownedGroup(pg, groupId, ownerId)) return res.status(404).json({ error: GROUP_NOT_FOUND });
+    if (input.name !== undefined) await assertGroupNameFree(pg, ownerId, input.name, groupId);
+    await pg.query("UPDATE academic_groups SET name=COALESCE($3, name), subject=CASE WHEN $4 THEN $5 ELSE subject END WHERE id=$1 AND owner_id=$2",
+      [groupId, ownerId, input.name ?? null, input.subject !== undefined, input.subject ?? null]);
+    const result = await pg.query(`SELECT ${GROUP_COLUMNS} FROM academic_groups g WHERE g.id=$1 AND g.owner_id=$2`, [groupId, ownerId]);
+    if (!result.rowCount) return res.status(404).json({ error: GROUP_NOT_FOUND });
+    res.json(result.rows[0]);
+  });
+  /** Deletes the group with its students, attendance and grades (ON DELETE CASCADE). */
+  app.delete("/api/teacher/groups/:groupId", auth, async (req, res) => {
+    const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND);
+    const pg = await catalog(res); if (!pg) return;
+    const result = await pg.query("DELETE FROM academic_groups WHERE id=$1 AND owner_id=$2", [groupId, userOf(req).id]);
+    if (!result.rowCount) return res.status(404).json({ error: GROUP_NOT_FOUND });
+    res.status(204).end();
   });
   app.get("/api/teacher/groups/:groupId/students", auth, async (req, res) => {
     const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND);
@@ -206,6 +233,35 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     if (count >= LIMITS.studentsPerGroup) throw new HttpError(409, `Grupa a atins limita de ${LIMITS.studentsPerGroup} studenți.`);
     const result = await pg.query("INSERT INTO students(group_id,first_name,last_name) VALUES($1,$2,$3) RETURNING *", [groupId, input.firstName, input.lastName]);
     res.status(201).json(result.rows[0]);
+  });
+  const OWNED_STUDENT = "SELECT s.id FROM students s JOIN academic_groups g ON g.id=s.group_id WHERE s.id=$1 AND g.owner_id=$2";
+  app.patch("/api/teacher/students/:studentId", auth, async (req, res) => {
+    const studentId = parseUuid(req.params.studentId, STUDENT_NOT_FOUND); const input = studentPatchSchema.parse(req.body);
+    const pg = await catalog(res); if (!pg) return;
+    const result = await pg.query(`UPDATE students SET first_name=COALESCE($3, first_name), last_name=COALESCE($4, last_name) WHERE id IN (${OWNED_STUDENT}) RETURNING *`,
+      [studentId, userOf(req).id, input.firstName ?? null, input.lastName ?? null]);
+    if (!result.rowCount) return res.status(404).json({ error: STUDENT_NOT_FOUND });
+    res.json(result.rows[0]);
+  });
+  /** Deletes the student with their attendance entries and grades (ON DELETE CASCADE). */
+  app.delete("/api/teacher/students/:studentId", auth, async (req, res) => {
+    const studentId = parseUuid(req.params.studentId, STUDENT_NOT_FOUND);
+    const pg = await catalog(res); if (!pg) return;
+    const result = await pg.query(`DELETE FROM students WHERE id IN (${OWNED_STUDENT})`, [studentId, userOf(req).id]);
+    if (!result.rowCount) return res.status(404).json({ error: STUDENT_NOT_FOUND });
+    res.status(204).end();
+  });
+  /** Saved attendance of one day (default: today in the university time zone). */
+  app.get("/api/teacher/groups/:groupId/attendance", auth, async (req, res) => {
+    const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND);
+    const date = attendanceQuerySchema.parse({ date: req.query.date }).date ?? isoDateInChisinau();
+    const pg = await catalog(res); if (!pg) return;
+    if (!await ownedGroup(pg, groupId, userOf(req).id)) return res.status(404).json({ error: GROUP_NOT_FOUND });
+    const session = await pg.query("SELECT id, topic FROM attendance_sessions WHERE group_id=$1 AND occurred_on=$2", [groupId, date]);
+    const entries = session.rowCount
+      ? (await pg.query("SELECT e.student_id AS \"studentId\", e.status FROM attendance_entries e WHERE e.session_id=$1 ORDER BY e.student_id", [session.rows[0].id])).rows
+      : [];
+    res.json({ date, sessionId: session.rows[0]?.id ?? null, topic: session.rows[0]?.topic ?? null, entries });
   });
   app.post("/api/teacher/groups/:groupId/attendance", auth, async (req, res) => {
     const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND); const input = attendanceSchema.parse(req.body);
@@ -233,12 +289,25 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     }
     res.status(204).end();
   });
+  app.get("/api/teacher/students/:studentId/grades", auth, async (req, res) => {
+    const studentId = parseUuid(req.params.studentId, STUDENT_NOT_FOUND);
+    const pg = await catalog(res); if (!pg) return;
+    const owned = await pg.query(OWNED_STUDENT, [studentId, userOf(req).id]);
+    if (!owned.rowCount) return res.status(404).json({ error: STUDENT_NOT_FOUND });
+    const result = await pg.query(`SELECT ${GRADE_COLUMNS} FROM lab_grades WHERE student_id=$1 ORDER BY created_at, id`, [studentId]);
+    res.json(result.rows);
+  });
+  /** One grade per laboratory: saving the same laboratory again replaces the grade (201 created, 200 replaced). */
   app.post("/api/teacher/students/:studentId/grades", auth, async (req, res) => {
     const studentId = parseUuid(req.params.studentId, STUDENT_NOT_FOUND); const input = gradeSchema.parse(req.body);
     const pg = await catalog(res); if (!pg) return;
-    const result = await pg.query("INSERT INTO lab_grades(student_id,laboratory,grade,presented_on,feedback) SELECT s.id,$2,$3,$4,$5 FROM students s JOIN academic_groups g ON g.id=s.group_id WHERE s.id=$1 AND g.owner_id=$6 RETURNING id,student_id,laboratory,presented_on,grade::float8 AS grade,feedback,created_at", [studentId, input.laboratory, input.grade, input.presentedOn ?? null, input.feedback, userOf(req).id]);
+    const result = await pg.query(`INSERT INTO lab_grades(student_id,laboratory,grade,presented_on,feedback)
+      SELECT s.id,$3,$4,$5,$6 FROM students s JOIN academic_groups g ON g.id=s.group_id WHERE s.id=$1 AND g.owner_id=$2
+      ON CONFLICT(student_id,laboratory) DO UPDATE SET grade=EXCLUDED.grade, presented_on=EXCLUDED.presented_on, feedback=EXCLUDED.feedback, created_at=now()
+      RETURNING ${GRADE_COLUMNS}, (xmax = 0) AS inserted`, [studentId, userOf(req).id, input.laboratory, input.grade, input.presentedOn ?? null, input.feedback]);
     if (!result.rowCount) return res.status(404).json({ error: STUDENT_NOT_FOUND });
-    res.status(201).json(result.rows[0]);
+    const { inserted, ...grade } = result.rows[0];
+    res.status(inserted ? 201 : 200).json(grade);
   });
 
   // ---- Telegram webhook (only active in webhook mode, authenticated by the secret token) ----
@@ -261,13 +330,21 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     if (res.headersSent) return next(error);
     if (error instanceof ZodError) return res.status(400).json({ error: "Date invalide", fields: error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })) });
     if (error instanceof HttpError) return res.status(error.status).json({ error: error.message });
-    const details = (error ?? {}) as { type?: string, status?: number, code?: string };
+    const details = (error ?? {}) as { type?: string, status?: number, code?: string, constraint?: string };
     if (details.type === "entity.parse.failed") return res.status(400).json({ error: "Corpul cererii nu este JSON valid" });
     if (details.type === "entity.too.large") return res.status(413).json({ error: "Cererea este prea mare" });
     if (typeof details.status === "number" && details.status >= 400 && details.status < 500) return res.status(details.status).json({ error: "Cerere invalidă" });
     // PostgreSQL constraint errors caused by user input.
+    if (isConnectionError(error)) {
+      // PostgreSQL went away after startup: re-check the schema once it is reachable again.
+      resetAcademicSchema();
+      log.warn("PostgreSQL catalog unavailable:", error instanceof Error ? error.message : error);
+      return res.status(503).json({ error: CATALOG_UNAVAILABLE });
+    }
+    if (details.code === "23505" && details.constraint?.startsWith("academic_groups")) return res.status(409).json({ error: "Ai deja o grupă cu acest nume (literele mari și mici nu contează)." });
     if (details.code === "23505") return res.status(409).json({ error: "Există deja o înregistrare cu aceste date (de ex. o grupă cu același nume)." });
     if (details.code === "23503") return res.status(404).json({ error: "Resursa asociată nu a fost găsită" });
+    if (details.code === "22008" || details.code === "22007") return res.status(400).json({ error: "Data nu este validă" });
     if (details.code === "22P02" || details.code === "22003" || details.code === "23514") return res.status(400).json({ error: "Date invalide" });
     log.error("Unhandled request error:", error);
     res.status(500).json({ error: "Eroare internă" });

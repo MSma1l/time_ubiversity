@@ -44,7 +44,8 @@ export const lessonSchema = z.object(lessonFields).refine(endsAfterStart, endAft
 export const lessonUpdateSchema = z.object({ ...lessonFields, role: role.optional() }).refine(endsAfterStart, endAfterStart);
 
 export const profilePatchSchema = z.object({
-  role: role.optional(), studentEnabled: z.boolean().optional(), teacherEnabled: z.boolean().optional()
+  role: role.optional(), studentEnabled: z.boolean().optional(), teacherEnabled: z.boolean().optional(),
+  remindersEnabled: z.boolean({ error: "Valoare invalidă pentru memento-uri" }).optional()
 }).refine((value) => Object.values(value).some((item) => item !== undefined), { message: "Nicio modificare trimisă" });
 
 export const notificationsReadSchema = z.object({ role: role.optional() }).optional();
@@ -52,13 +53,29 @@ export const notificationsReadSchema = z.object({ role: role.optional() }).optio
 export const lessonIdSchema = z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const uuidSchema = z.uuid();
 
+/** Calendar date accepted by PostgreSQL and meaningful for a university catalog (years 2000–2100). */
+export const catalogDateSchema = z.iso.date({ error: "Data trebuie să fie în format YYYY-MM-DD" })
+  .refine((value) => { const year = Number(value.slice(0, 4)); return year >= 2000 && year <= 2100; }, { message: "Anul trebuie să fie între 2000 și 2100" });
+
+const atLeastOne = { message: "Nicio modificare trimisă" };
+const hasChanges = (value: object) => Object.values(value).some((item) => item !== undefined);
+
+/** GET /api/teacher/groups/:groupId/attendance?date=YYYY-MM-DD (optional). */
+export const attendanceQuerySchema = z.object({ date: catalogDateSchema.optional() });
+
 export const groupSchema = z.object({ name: text(2, 80), subject: optionalText(120) });
+/** PATCH /api/teacher/groups/:groupId — `subject: null` or "" clears the subject. */
+export const groupPatchSchema = z.object({
+  name: text(2, 80).optional(),
+  subject: text(0, 120).nullable().optional().transform((value) => (value === undefined ? undefined : value || null))
+}).refine(hasChanges, atLeastOne);
 export const studentSchema = z.object({ firstName: text(1, 80), lastName: text(1, 80) });
+export const studentPatchSchema = z.object({ firstName: text(1, 80).optional(), lastName: text(1, 80).optional() }).refine(hasChanges, atLeastOne);
 export const attendanceSchema = z.object({
-  date: z.iso.date(), topic: optionalText(160),
+  date: catalogDateSchema, topic: optionalText(160),
   entries: z.array(z.object({ studentId: z.uuid(), status: z.enum(["present", "absent", "late"]) })).max(500)
 });
 export const gradeSchema = z.object({
   laboratory: text(1, 120), grade: z.number().min(0).max(10),
-  presentedOn: z.iso.date().optional(), feedback: z.string().trim().max(500).optional().transform((value) => (value ? value : null))
+  presentedOn: catalogDateSchema.optional(), feedback: z.string().trim().max(500).optional().transform((value) => (value ? value : null))
 });

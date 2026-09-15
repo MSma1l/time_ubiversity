@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { openDatabase, pruneDatabase } from "./db.js";
+import { minutesLabel } from "./labels.js";
 import { sendDueReminders } from "./reminders.js";
 import { TelegramApiError } from "./telegram.js";
 
@@ -25,7 +26,7 @@ describe("sendDueReminders", () => {
     // A second tick in the same or next minute (or a restarted process) must not resend.
     expect(await sendDueReminders(db, send, AT_0745, silent)).toBe(0);
     expect(await sendDueReminders(db, send, new Date(AT_0745.getTime() + 60_000), silent)).toBe(0);
-    expect(sent).toEqual([[1, "🔔 În 15 min: Fizică\n08:00–09:30 · Sala 3-101"]]);
+    expect(sent).toEqual([[1, "🔔 În 15 minute: Fizică\n08:00–09:30 · Sala 3-101"]]);
     expect(db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE kind='reminder'").get()).toEqual({ c: 1 });
     expect(db.prepare("SELECT role FROM notifications WHERE kind='reminder'").get()).toEqual({ role: "student" });
   });
@@ -58,7 +59,7 @@ describe("sendDueReminders", () => {
     expect(await sendDueReminders(db, send, at(17), silent)).toBe(1);
     expect(await sendDueReminders(db, send, at(18), silent)).toBe(0);
     expect(await sendDueReminders(db, send, at(20), silent)).toBe(0);
-    expect(sent).toEqual(["🔔 A început acum 2 min: Fizică\n08:00–09:30"]);
+    expect(sent).toEqual(["🔔 A început acum 2 minute: Fizică\n08:00–09:30"]);
   });
 
   it("does not send a start-time reminder more than the grace window after the lesson started", async () => {
@@ -69,9 +70,37 @@ describe("sendDueReminders", () => {
     expect(sent).toEqual([]);
   });
 
+  it("uses Romanian grammar for minutes in the reminder and the stored notification", async () => {
+    const { db, insert } = setup();
+    insert.run(1, "student", "Fizică", null, 1, "08:05", "09:30", "every", 20);
+    const sent: string[] = [];
+    expect(await sendDueReminders(db, async (_c, text) => { sent.push(text); }, AT_0745, silent)).toBe(1);
+    expect(sent).toEqual(["🔔 În 20 de minute: Fizică\n08:05–09:30"]);
+    expect(db.prepare("SELECT title FROM notifications WHERE kind='reminder'").get()).toEqual({ title: "În 20 de minute începe Fizică" });
+  });
+
+  it("skips profiles with reminders turned off without touching lesson settings", async () => {
+    const { db, insert } = setup();
+    insert.run(1, "student", "A", null, 1, "08:00", "09:00", "every", 15);
+    insert.run(2, "student", "B", null, 1, "08:00", "09:00", "every", 15);
+    db.prepare("INSERT INTO profiles (telegram_id, display_name, reminders_enabled) VALUES (1, 'Off', 0), (2, 'On', 1)").run();
+    const chats: number[] = [];
+    expect(await sendDueReminders(db, async (chatId) => { chats.push(chatId); }, AT_0745, silent)).toBe(1);
+    expect(chats).toEqual([2]);
+    expect(db.prepare("SELECT COUNT(*) AS c FROM lessons WHERE notifications_enabled=1").get()).toEqual({ c: 2 });
+  });
+
   it("prunes old reminder bookkeeping", () => {
     const { db } = setup();
     db.prepare("INSERT INTO delivered_reminders VALUES (1, '2026-08-01-08:00')").run();
     expect(pruneDatabase(db, "2026-09-14").reminders).toBe(1);
+  });
+});
+
+describe("minutesLabel", () => {
+  it("follows Romanian number agreement", () => {
+    expect([1, 2, 19, 20, 101, 119, 120, 100].map(minutesLabel)).toEqual([
+      "1 minut", "2 minute", "19 minute", "20 de minute", "101 minute", "119 minute", "120 de minute", "100 de minute"
+    ]);
   });
 });

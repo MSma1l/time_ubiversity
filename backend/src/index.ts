@@ -3,7 +3,7 @@ import type { Server } from "node:http";
 import cron from "node-cron";
 import { closeAcademicDatabase, initAcademicWithRetry } from "./academic.js";
 import { createApp } from "./app.js";
-import { configureWebhook, startPolling } from "./bot.js";
+import { configureWebhook, registerBotCommands, startPolling } from "./bot.js";
 import { ConfigError, loadConfig, miniAppButton, type AppConfig } from "./config.js";
 import { openDatabase, pruneDatabase, type SqliteDatabase } from "./db.js";
 import { sendDueReminders } from "./reminders.js";
@@ -61,6 +61,7 @@ const maintenanceTask = cron.schedule("17 4 * * *", () => {
 const polling = config.polling && config.token ? startPolling(db, config) : undefined;
 if (config.polling && !config.token) console.warn("TELEGRAM_POLLING=true but TELEGRAM_BOT_TOKEN is empty: polling is disabled");
 void configureWebhook(config, lifecycle.signal);
+if (config.token) void registerBotCommands(config, lifecycle.signal);
 
 let shuttingDown = false;
 async function shutdown(signal: string) {

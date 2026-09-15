@@ -41,6 +41,7 @@ function migrateLegacySchema(db: SqliteDatabase) {
     ["profiles", "role", "TEXT NOT NULL DEFAULT 'student'"],
     ["profiles", "student_enabled", "INTEGER NOT NULL DEFAULT 1"],
     ["profiles", "teacher_enabled", "INTEGER NOT NULL DEFAULT 1"],
+    ["profiles", "reminders_enabled", "INTEGER NOT NULL DEFAULT 1"],
     ["lessons", "role", "TEXT NOT NULL DEFAULT 'student'"],
     ["lessons", "week_kind", "TEXT NOT NULL DEFAULT 'every'"],
     ["lessons", "reminder_minutes", "INTEGER NOT NULL DEFAULT 15"],
@@ -56,6 +57,10 @@ function migrateLegacySchema(db: SqliteDatabase) {
       WHERE role IS NULL OR role NOT IN ('student','teacher')`);
     normaliseRole("lessons");
     normaliseRole("profiles");
+    // Profile mode rules (see profile.ts): at least one mode enabled and the active role is an enabled mode.
+    db.exec(`UPDATE profiles SET student_enabled=1 WHERE NOT student_enabled AND NOT teacher_enabled`);
+    db.exec(`UPDATE profiles SET role='teacher' WHERE role='student' AND NOT student_enabled AND teacher_enabled`);
+    db.exec(`UPDATE profiles SET role='student' WHERE role='teacher' AND NOT teacher_enabled AND student_enabled`);
     db.exec(`UPDATE lessons SET week_kind = CASE WHEN lower(trim(week_kind)) IN ('odd','impara','impară') THEN 'odd' WHEN lower(trim(week_kind)) IN ('even','para','pară') THEN 'even' ELSE 'every' END
       WHERE week_kind IS NULL OR week_kind NOT IN ('odd','even','every')`);
     // Times written as "9:30" by older clients break ordering and the end > start comparison.

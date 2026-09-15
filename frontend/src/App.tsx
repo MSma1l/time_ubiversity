@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { ApiError, deleteLessonRemote, devTelegramId, errorMessage, loadAccount, markNotificationsRead, saveLessonRemote, updateLessonRemote, updateProfileState, updateRole } from './api'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ApiError, deleteLessonRemote, devTelegramId, errorMessage, loadAccount, loadNotifications, markNotificationsRead, saveLessonRemote, updateLessonRemote, updateProfileState, updateRole } from './api'
 import { BellIcon, LessonCard } from './components/LessonCard'
 import { LessonEditor, type EditorFailure } from './components/LessonEditor'
-import { CalendarPanel, NotificationPanel, ProfilePanel } from './components/Panels'
+import { CalendarPanel, NotificationPanel, ProfilePanel, WeekNav } from './components/Panels'
 import { TeacherCatalog } from './components/TeacherCatalog'
 import { initialOf, minutesLabel, roleLabels } from './labels'
-import { addDays, byStartTime, dayOfMonth, demoLessons, formatDayMonth, lessonMatchesWeek, timeToMinutes, universityClock, weekdayNames, weekTypeFor } from './schedule'
+import { addDays, byStartTime, currentInstant, dayOfMonth, demoLessons, formatDayMonth, formatWeekRange, lessonMatchesWeek, mondayOf, timeToMinutes, universityClock, weekdayNames, weekTypeFor, weekTypeLabels } from './schedule'
 import { confirmAction, detectSession } from './telegram'
+import type { AccountProfile } from './api'
 import type { AppNotification, Lesson, Role } from './types'
 
 type SyncState = 'loading' | 'ready' | 'error' | 'demo'
@@ -14,6 +15,23 @@ type Notice = { kind: 'success' | 'error', text: string }
 
 const NOTICE_TIMEOUT_MS = 5_000
 const CLOCK_TICK_MS = 30_000
+/** Notifications are re-fetched when the app becomes visible again, at most once in this interval. */
+const NOTIFICATIONS_REFRESH_MIN_MS = 15_000
+const VISIBILITY_DEBOUNCE_MS = 400
+const otherRole = (value: Role): Role => value === 'student' ? 'teacher' : 'student'
+
+/** Server notifications win, but a read mark set locally (request still in flight) is kept. */
+function mergeNotifications(local: AppNotification[], server: AppNotification[]) {
+  const readLocally = new Map(local.filter((item) => item.readAt).map((item) => [item.id, item.readAt]))
+  return server.map((item) => item.readAt || !readLocally.has(item.id) ? item : { ...item, readAt: readLocally.get(item.id) ?? null })
+}
+
+type RoleState = { role: Role, enabled: Record<Role, boolean> }
+/** Never both modes disabled, and the active role is always an enabled one. */
+function consistentRoles({ role, enabled }: RoleState): RoleState {
+  const safe = enabled.student || enabled.teacher ? enabled : { ...enabled, student: true }
+  return { role: safe[role] ? role : otherRole(role), enabled: safe }
+}
 const demoNotifications: AppNotification[] = [{ id: 1, kind: 'system', title: 'Bine ai venit în Orar Univer', body: 'Configurează orele și vei primi memento-uri direct în Telegram.', readAt: null, createdAt: new Date().toISOString() }]
 
 export function App() {
@@ -34,17 +52,24 @@ function OpenInTelegram() {
 }
 
 function Schedule({ initialName, demo }: { initialName: string, demo: boolean }) {
-  const [now, setNow] = useState(() => new Date())
+  const [now, setNow] = useState(() => currentInstant())
   const today = useMemo(() => universityClock(now), [now])
+  /** Parity of the current (real) week. */
   const week = weekTypeFor(today.isoDate)
   const [role, setRole] = useState<Role>('student')
   const [activeDay, setActiveDay] = useState(today.weekdayIndex)
+  /** Displayed week relative to the current one (0 = this week); shared by the day view and the calendar. */
+  const [weekOffset, setWeekOffset] = useState(0)
+  const weekStart = mondayOf(today.isoDate, weekOffset)
+  const displayedWeek = weekTypeFor(weekStart)
   const [lessons, setLessons] = useState<Lesson[]>(demo ? demoLessons : [])
   const [notifications, setNotifications] = useState<AppNotification[]>(demo ? demoNotifications : [])
   const [roleEnabled, setRoleEnabled] = useState<Record<Role, boolean>>({ student: true, teacher: true })
   const [name, setName] = useState(initialName)
   const [syncState, setSyncState] = useState<SyncState>(demo ? 'demo' : 'loading')
   const [loadError, setLoadError] = useState('')
+  /** The load failed with 401/403: retrying will not help, the Mini App has to be reopened. */
+  const [sessionExpired, setSessionExpired] = useState(false)
   const [reloadKey, setReloadKey] = useState(0)
   const [notice, setNotice] = useState<Notice | null>(null)
   /** `role` is the schedule chosen when the editor opened; later role changes do not affect the lesson being edited. */
@@ -55,6 +80,9 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   const [catalogOpen, setCatalogOpen] = useState(false)
   const [groupSettingsOpen, setGroupSettingsOpen] = useState(false)
   const lastDateRef = useRef(today.isoDate)
+  /** Profile PATCH requests are serialised: a second tap while one is pending is ignored. */
+  const profileBusyRef = useRef(false)
+  const lastNotificationsFetchRef = useRef(0)
 
   const synced = syncState === 'ready'
   const success = (text: string) => setNotice({ kind: 'success', text })
@@ -63,9 +91,9 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   // Keep "now" fresh; when the university date changes, jump to the new day.
   useEffect(() => {
     const timer = window.setInterval(() => {
-      const current = new Date()
+      const current = currentInstant()
       const clock = universityClock(current)
-      if (clock.isoDate !== lastDateRef.current) { lastDateRef.current = clock.isoDate; setActiveDay(clock.weekdayIndex) }
+      if (clock.isoDate !== lastDateRef.current) { lastDateRef.current = clock.isoDate; setActiveDay(clock.weekdayIndex); setWeekOffset(0) }
       setNow(current)
     }, CLOCK_TICK_MS)
     return () => window.clearInterval(timer)
@@ -78,15 +106,20 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
       .then(({ profile, lessons: savedLessons, notifications: savedNotifications }) => {
         if (!active) return
         setName((current) => profile.displayName || current)
-        setRole(profile.role)
-        setRoleEnabled({ student: profile.studentEnabled, teacher: profile.teacherEnabled })
+        const roles = consistentRoles({ role: profile.role, enabled: { student: profile.studentEnabled, teacher: profile.teacherEnabled } })
+        setRole(roles.role)
+        setRoleEnabled(roles.enabled)
         setLessons(savedLessons)
         setNotifications(savedNotifications)
+        lastNotificationsFetchRef.current = Date.now()
         setSyncState('ready')
+        // The saved role is a disabled mode: store the enabled one (best effort — the UI already shows it).
+        if (roles.role !== profile.role) updateRole(roles.role).catch(() => undefined)
       })
       .catch((error) => {
         if (!active) return
         setLoadError(errorMessage(error, 'Nu s-a putut încărca orarul.'))
+        setSessionExpired(error instanceof ApiError && (error.status === 401 || error.status === 403))
         setSyncState('error')
       })
     return () => { active = false }
@@ -100,7 +133,10 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
 
   const retryLoad = () => { setSyncState('loading'); setLoadError(''); setReloadKey((value) => value + 1) }
 
-  const displayedLessons = useMemo(() => lessons.filter((item) => item.role === role && item.weekday === activeDay && lessonMatchesWeek(item, week)).sort(byStartTime), [activeDay, lessons, role, week])
+  const dayLessons = lessons.filter((item) => item.role === role && item.weekday === activeDay)
+  const displayedLessons = dayLessons.filter((item) => lessonMatchesWeek(item, displayedWeek)).sort(byStartTime)
+  /** Lessons of this day that only happen in the other parity — hidden in the displayed week. */
+  const otherParityCount = dayLessons.length - displayedLessons.length
 
   const nextLesson = useMemo(() => {
     const roleLessons = lessons.filter((item) => item.role === role)
@@ -138,6 +174,7 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   /** Returns the reason (also shown as a notice) when a change cannot be persisted right now, otherwise null. */
   const notWritableReason = () => {
     if (synced || syncState === 'demo') return null
+    if (syncState === 'error' && sessionExpired) return loadError
     return syncState === 'loading' ? 'Orarul încă se încarcă. Încearcă în câteva secunde.' : 'Orarul nu este sincronizat. Apasă „Reîncearcă” mai întâi.'
   }
   const failureOf = (error: unknown, fallback: string): EditorFailure => ({
@@ -153,10 +190,14 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
       const saved = synced ? await (isNew ? saveLessonRemote(lesson) : updateLessonRemote(lesson)) : lesson
       setLessons((items) => isNew ? [...items, saved] : items.map((item) => item.id === lesson.id ? saved : item))
       setEditor(null)
-      // Show the day of the saved lesson, and say so when its week parity hides it this week.
+      // Show the day of the saved lesson; when its parity hides it in the displayed week, move to the next week, where it appears.
       setActiveDay(saved.weekday)
-      const hiddenThisWeek = lessonMatchesWeek(saved, week) ? '' : ` Apare doar în săptămânile ${saved.weekType === 'even' ? 'pare' : 'impare'} (aceasta este ${week === 'even' ? 'pară' : 'impară'}).`
-      success((isNew ? (synced ? `Ora a fost salvată în orarul de ${roleLabels[saved.role]}.` : 'Ora a fost adăugată doar local (mod demonstrativ).') : 'Ora a fost modificată.') + hiddenThisWeek)
+      let moved = ''
+      if (!lessonMatchesWeek(saved, displayedWeek)) {
+        setWeekOffset(weekOffset + 1)
+        moved = ` Apare doar în săptămânile ${saved.weekType === 'even' ? 'pare' : 'impare'} — afișăm săptămâna ${formatWeekRange(mondayOf(today.isoDate, weekOffset + 1))}.`
+      }
+      success((isNew ? (synced ? `Ora a fost salvată în orarul de ${roleLabels[saved.role]}.` : 'Ora a fost adăugată doar local (mod demonstrativ).') : 'Ora a fost modificată.') + moved)
       return null
     } catch (error) {
       return failureOf(error, isNew ? 'Ora nu a putut fi salvată. Încearcă din nou.' : 'Modificarea nu a putut fi salvată.')
@@ -181,51 +222,124 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   const openNewLesson = (day = activeDay, time = '08:00') => setEditor({ lesson: null, slot: { day: Math.min(day, weekdayNames.length - 1), time }, role })
   const openLesson = (lesson: Lesson) => setEditor({ lesson, slot: null, role: lesson.role })
 
-  const chooseRole = async (next: Role) => {
-    if (next === role) return
-    // Before the profile is loaded the server role would overwrite a local choice.
-    if (syncState === 'loading') { failure('Orarul încă se încarcă. Încearcă în câteva secunde.'); return }
-    if (!roleEnabled[next]) { failure(`Modul ${roleLabels[next]} este dezactivat. Activează-l din Profil.`); return }
-    const previous = role
-    setRole(next)
-    try { if (synced) await updateRole(next) } catch (error) { setRole(previous); failure(errorMessage(error, 'Rolul nu a putut fi actualizat.')) }
+  /** Applies the fields returned by PATCH /api/me (the server is the source of truth). */
+  const applyServerProfile = (profile: Partial<Pick<AccountProfile, 'role' | 'studentEnabled' | 'teacherEnabled'>>, fallback: RoleState) => {
+    const roles = consistentRoles({
+      role: profile.role ?? fallback.role,
+      enabled: { student: profile.studentEnabled ?? fallback.enabled.student, teacher: profile.teacherEnabled ?? fallback.enabled.teacher },
+    })
+    setRole(roles.role)
+    setRoleEnabled(roles.enabled)
   }
 
-  const toggleRoleEnabled = async (kind: Role) => {
-    if (syncState === 'loading') { failure('Orarul încă se încarcă. Încearcă în câteva secunde.'); return }
-    const next = !roleEnabled[kind]
-    const other: Role = kind === 'student' ? 'teacher' : 'student'
-    if (!next && !roleEnabled[other]) { failure('Cel puțin un mod trebuie să rămână activ.'); return }
-    setRoleEnabled((value) => ({ ...value, [kind]: next }))
-    if (!next && role === kind) setRole(other)
+  /** Same guard as lesson saves; in demo mode changes stay local. Returns false (after showing why) when blocked. */
+  const canChangeProfile = () => {
+    const blocked = notWritableReason()
+    if (blocked) { failure(blocked); return false }
+    if (profileBusyRef.current) return false
+    return true
+  }
+
+  const chooseRole = async (next: Role) => {
+    if (next === role) return
+    if (!canChangeProfile()) return
+    if (!roleEnabled[next]) { failure(`Modul ${roleLabels[next]} este dezactivat. Activează-l din Profil.`); return }
+    const previous: RoleState = { role, enabled: roleEnabled }
+    setRole(next)
+    if (!synced) return
+    profileBusyRef.current = true
     try {
-      if (synced) {
-        await updateProfileState(kind === 'student' ? { studentEnabled: next } : { teacherEnabled: next })
-        if (!next && role === kind) await updateRole(other)
-      }
+      applyServerProfile(await updateRole(next), { role: next, enabled: roleEnabled })
     } catch (error) {
-      setRoleEnabled((value) => ({ ...value, [kind]: !next }))
-      if (!next && role === kind) setRole(kind)
-      failure(errorMessage(error, 'Starea nu a putut fi actualizată.'))
+      // 401 (expired session), 409 (mode disabled on the server), network…: undo the local change and say why.
+      setRole(previous.role)
+      setRoleEnabled(previous.enabled)
+      failure(errorMessage(error, 'Rolul nu a putut fi actualizat.'))
+    } finally {
+      profileBusyRef.current = false
     }
   }
 
+  const toggleRoleEnabled = async (kind: Role) => {
+    if (!canChangeProfile()) return
+    const next = !roleEnabled[kind]
+    const other = otherRole(kind)
+    if (!next && !roleEnabled[other]) { failure('Cel puțin un mod trebuie să rămână activ.'); return }
+    const previous: RoleState = { role, enabled: roleEnabled }
+    const target: RoleState = { role: !next && role === kind ? other : role, enabled: { ...roleEnabled, [kind]: next } }
+    setRole(target.role)
+    setRoleEnabled(target.enabled)
+    if (!synced) return
+    profileBusyRef.current = true
+    let roleChanged = false
+    try {
+      // Leave the mode first, so the server never has the active role disabled.
+      if (target.role !== previous.role) { await updateRole(target.role); roleChanged = true }
+      applyServerProfile(await updateProfileState(kind === 'student' ? { studentEnabled: next } : { teacherEnabled: next }), target)
+    } catch (error) {
+      if (roleChanged) updateRole(previous.role).catch(() => undefined)
+      setRole(previous.role)
+      setRoleEnabled(previous.enabled)
+      failure(errorMessage(error, 'Starea nu a putut fi actualizată.'))
+    } finally {
+      profileBusyRef.current = false
+    }
+  }
+
+  /** Re-fetches notifications created on the server (reminders, "Orar actualizat") without losing local read marks. */
+  const refreshNotifications = useCallback(async () => {
+    if (!synced) return null
+    lastNotificationsFetchRef.current = Date.now()
+    try {
+      const fresh = await loadNotifications()
+      setNotifications((local) => mergeNotifications(local, fresh))
+      return fresh
+    } catch {
+      return null // Keep what is already shown; a failed background refresh is not worth an error notice.
+    }
+  }, [synced])
+
+  useEffect(() => {
+    if (!synced) return
+    let timer = 0
+    const onVisibility = () => {
+      if (document.visibilityState !== 'visible') return
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        if (Date.now() - lastNotificationsFetchRef.current >= NOTIFICATIONS_REFRESH_MIN_MS) void refreshNotifications()
+      }, VISIBILITY_DEBOUNCE_MS)
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => { document.removeEventListener('visibilitychange', onVisibility); window.clearTimeout(timer) }
+  }, [synced, refreshNotifications])
+
   const openNotifications = async () => {
     setNotificationsOpen(true)
-    if (!roleNotifications.some((item) => !item.readAt)) return
+    const openedFor = role
+    const current = synced ? (await refreshNotifications()) ?? notifications : notifications
+    const forRole = (item: AppNotification) => !item.role || item.role === openedFor
+    if (!current.some((item) => forRole(item) && !item.readAt)) return
     try {
-      if (synced) await markNotificationsRead(role)
+      if (synced) await markNotificationsRead(openedFor)
       else if (syncState !== 'demo') return
       const readAt = new Date().toISOString()
-      setNotifications((items) => items.map((item) => belongsToRole(item) ? { ...item, readAt: item.readAt ?? readAt } : item))
+      setNotifications((items) => items.map((item) => forRole(item) ? { ...item, readAt: item.readAt ?? readAt } : item))
     } catch (error) {
       failure(errorMessage(error, 'Notificările nu au putut fi marcate ca citite.'))
     }
   }
 
-  const dateForDay = (dayIndex: number) => addDays(today.isoDate, dayIndex - today.weekdayIndex)
+  const shiftWeek = (delta: number) => setWeekOffset((value) => value + delta)
+  const resetWeek = () => { setWeekOffset(0); setActiveDay(today.weekdayIndex) }
+  const selectDay = (index: number) => {
+    // On Sunday the next Monday is tomorrow: show it instead of the Monday that has passed.
+    if (today.weekdayIndex === weekdayNames.length - 1 && weekOffset === 0 && index === 0) setWeekOffset(1)
+    setActiveDay(index)
+  }
+
+  const dateForDay = (dayIndex: number) => addDays(weekStart, dayIndex)
   const unreadCount = roleNotifications.filter((item) => !item.readAt).length
-  const isToday = activeDay === today.weekdayIndex
+  const isToday = weekOffset === 0 && activeDay === today.weekdayIndex
 
   return <main className="app-shell">
     <header className="topbar">
@@ -253,13 +367,18 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
       </div>
     </section>
 
+    <WeekNav start={weekStart} offset={weekOffset} onShift={shiftWeek} onReset={resetWeek} resetVisible={!isToday} />
     <nav className="day-tabs" aria-label="Alege ziua">
-      {weekdayNames.map((day, index) => <button type="button" key={day} className={activeDay === index ? 'active' : ''} aria-pressed={activeDay === index} aria-label={`${day} ${formatDayMonth(dateForDay(index))}`} onClick={() => setActiveDay(index)}><span>{day.slice(0, 2)}</span><b>{dayOfMonth(dateForDay(index))}</b></button>)}
+      {weekdayNames.map((day, index) => {
+        const current = weekOffset === 0 && index === today.weekdayIndex
+        return <button type="button" key={day} className={[activeDay === index ? 'active' : '', current ? 'today' : ''].filter(Boolean).join(' ')} aria-pressed={activeDay === index} aria-current={current ? 'date' : undefined}
+          aria-label={`${day} ${formatDayMonth(dateForDay(index))}${current ? ', azi' : ''}`} onClick={() => selectDay(index)}><span>{day.slice(0, 2)}</span><b>{dayOfMonth(dateForDay(index))}</b></button>
+      })}
     </nav>
 
     <section className="schedule" aria-labelledby="schedule-heading">
       <div className="section-heading">
-        <div><p>{weekdayNames[activeDay]}, {formatDayMonth(dateForDay(activeDay))}</p><h2 id="schedule-heading">Orele tale</h2></div>
+        <div><p>{weekdayNames[activeDay]}, {formatDayMonth(dateForDay(activeDay))} · săpt. {weekTypeLabels[displayedWeek]}</p><h2 id="schedule-heading">Orele tale</h2></div>
         <button type="button" className="add-button" onClick={() => openNewLesson()} aria-label="Adaugă o oră">+</button>
       </div>
       {syncState === 'loading' && <p className="sync" role="status">Se conectează la orarul tău…</p>}
@@ -271,6 +390,9 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
       </div> : <div className="empty free-day">
         <span aria-hidden="true">☀️</span><h3>{isToday ? 'Ești liber azi' : 'Zi liberă'}</h3><p>Nu ai nicio pereche în această zi. Bucură-te de timp liber!</p><button type="button" onClick={() => openNewLesson()}>Adaugă o activitate</button>
       </div>}
+      {syncState !== 'loading' && syncState !== 'error' && otherParityCount > 0 && <button type="button" className="week-hint" onClick={() => shiftWeek(1)}>
+        {otherParityCount === 1 ? 'O oră' : `${otherParityCount} ore`} în această zi doar în săptămâna {weekTypeLabels[displayedWeek === 'even' ? 'odd' : 'even']} <span aria-hidden="true">›</span>
+      </button>}
     </section>
 
     <section className="reminder"><span aria-hidden="true">🔔</span><div><strong>{reminderStatus.title}</strong><p>{reminderStatus.text}</p></div><button type="button" onClick={openNotifications}>{unreadCount ? `Vezi (${unreadCount})` : 'Vezi'}</button></section>
@@ -284,12 +406,13 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
       <button type="button" className="nav-item" onClick={() => setProfileOpen(true)}><span aria-hidden="true">◌</span><small>Profil</small></button>
     </footer>
 
-    {calendarOpen && <CalendarPanel lessons={lessons} role={role} week={week} onClose={() => setCalendarOpen(false)} onAdd={openNewLesson} onEdit={(lesson) => { setCalendarOpen(false); openLesson(lesson) }} />}
+    {calendarOpen && <CalendarPanel lessons={lessons} role={role} weekStart={weekStart} weekOffset={weekOffset} onShiftWeek={shiftWeek} onResetWeek={() => setWeekOffset(0)}
+      onClose={() => setCalendarOpen(false)} onAdd={openNewLesson} onEdit={(lesson) => { setCalendarOpen(false); openLesson(lesson) }} />}
     {editor && <LessonEditor key={editor.lesson?.id ?? 'new'} role={editor.role} existing={editor.lesson} slot={editor.slot} onClose={() => setEditor(null)}
       onSave={(lesson) => saveLesson(lesson, !editor.lesson)} onDelete={editor.lesson ? () => removeLesson(editor.lesson as Lesson) : undefined} />}
     {notificationsOpen && <NotificationPanel items={roleNotifications} onClose={() => setNotificationsOpen(false)} />}
-    {profileOpen && <ProfilePanel name={name} role={role} week={week} enabled={roleEnabled} synced={synced} onClose={() => setProfileOpen(false)}
-      onSwitchRole={() => chooseRole(role === 'student' ? 'teacher' : 'student')} onToggle={toggleRoleEnabled} onOpenGroupSettings={() => { setProfileOpen(false); setGroupSettingsOpen(true) }} />}
+    {profileOpen && <ProfilePanel name={name} role={role} week={week} enabled={roleEnabled} synced={synced} error={notice?.kind === 'error' ? notice.text : ''} onClose={() => setProfileOpen(false)}
+      onSwitchRole={() => chooseRole(otherRole(role))} onToggle={toggleRoleEnabled} onOpenGroupSettings={() => { setProfileOpen(false); setGroupSettingsOpen(true) }} />}
     {groupSettingsOpen && <TeacherCatalog mode="settings" available={synced} onClose={() => setGroupSettingsOpen(false)} />}
     {catalogOpen && <TeacherCatalog mode="records" available={synced} onClose={() => setCatalogOpen(false)} />}
   </main>

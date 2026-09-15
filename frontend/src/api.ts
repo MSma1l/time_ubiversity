@@ -139,9 +139,21 @@ export async function updateLessonRemote(lesson: Lesson) {
 }
 export const deleteLessonRemote = async (id: string) => request<void>(`/api/lessons/${serverId(id)}`, { method: 'DELETE' })
 
-export const updateRole = (role: Role) => request<ApiProfile>('/api/me', { method: 'PATCH', body: JSON.stringify({ role }) })
-export const updateProfileState = (change: Partial<Pick<AccountProfile, 'studentEnabled' | 'teacherEnabled'>>) =>
-  request<ApiProfile>('/api/me', { method: 'PATCH', body: JSON.stringify(change) })
+/** PATCH /api/me answers with the updated profile (some backend versions wrap it in `{ profile }`). */
+const patchProfile = async (change: Partial<Pick<AccountProfile, 'role' | 'studentEnabled' | 'teacherEnabled'>>) => {
+  const body = await request<ApiProfile & { profile?: ApiProfile }>('/api/me', { method: 'PATCH', body: JSON.stringify(change) })
+  const profile = body?.profile ?? body ?? {}
+  // Only the fields the server actually returned; missing ones must not reset local state to defaults.
+  const result: Partial<Pick<AccountProfile, 'role' | 'studentEnabled' | 'teacherEnabled'>> = {}
+  if (profile.role === 'student' || profile.role === 'teacher') result.role = profile.role
+  if (profile.studentEnabled !== undefined && profile.studentEnabled !== null) result.studentEnabled = Boolean(profile.studentEnabled)
+  if (profile.teacherEnabled !== undefined && profile.teacherEnabled !== null) result.teacherEnabled = Boolean(profile.teacherEnabled)
+  return result
+}
+export const updateRole = (role: Role) => patchProfile({ role })
+export const updateProfileState = (change: Partial<Pick<AccountProfile, 'studentEnabled' | 'teacherEnabled'>>) => patchProfile(change)
+/** All notifications of the account (both schedules); the UI filters them per role. */
+export const loadNotifications = () => request<AppNotification[]>('/api/notifications')
 /** Marks as read the notifications of one schedule plus the general ones. */
 export const markNotificationsRead = (role: Role) => request<void>('/api/notifications/read', { method: 'PATCH', body: JSON.stringify({ role }) })
 
@@ -155,8 +167,23 @@ export const createTeacherGroup = (name: string, subject: string) =>
 export const loadTeacherStudents = (groupId: string) => request<TeacherStudent[]>(`/api/teacher/groups/${encodeURIComponent(groupId)}/students`)
 export const createTeacherStudent = (groupId: string, firstName: string, lastName: string) =>
   request<TeacherStudent>(`/api/teacher/groups/${encodeURIComponent(groupId)}/students`, { method: 'POST', body: JSON.stringify({ firstName: firstName.trim(), lastName: lastName.trim() }) })
-/** Upserts only the given entries for today's session (university time zone). */
-export const saveAttendance = (groupId: string, entries: Array<{ studentId: string, status: AttendanceStatus }>) =>
-  request<void>(`/api/teacher/groups/${encodeURIComponent(groupId)}/attendance`, { method: 'POST', body: JSON.stringify({ date: universityClock().isoDate, entries }) })
+/** Upserts only the given entries for the day's session (default: today in the university time zone). */
+export const saveAttendance = (groupId: string, entries: Array<{ studentId: string, status: AttendanceStatus }>, date = universityClock().isoDate) =>
+  request<void>(`/api/teacher/groups/${encodeURIComponent(groupId)}/attendance`, { method: 'POST', body: JSON.stringify({ date, entries }) })
+/** Saving the same laboratory again replaces the previous grade. */
 export const saveLabGrade = (studentId: string, laboratory: string, grade: number) =>
-  request<unknown>(`/api/teacher/students/${encodeURIComponent(studentId)}/grades`, { method: 'POST', body: JSON.stringify({ laboratory: laboratory.trim(), grade, presentedOn: universityClock().isoDate }) })
+  request<LabGrade>(`/api/teacher/students/${encodeURIComponent(studentId)}/grades`, { method: 'POST', body: JSON.stringify({ laboratory: laboratory.trim(), grade, presentedOn: universityClock().isoDate }) })
+
+export type LabGrade = { id: string, student_id: string, laboratory: string, presented_on: string | null, grade: number, feedback: string | null, created_at: string }
+export type SavedAttendance = { date: string, sessionId: string | null, topic: string | null, entries: Array<{ studentId: string, status: AttendanceStatus }> }
+
+/** Saved attendance of one day (default: today in the university time zone). */
+export const loadAttendance = (groupId: string, date = universityClock().isoDate) =>
+  request<SavedAttendance>(`/api/teacher/groups/${encodeURIComponent(groupId)}/attendance?date=${encodeURIComponent(date)}`)
+export const loadLabGrades = (studentId: string) => request<LabGrade[]>(`/api/teacher/students/${encodeURIComponent(studentId)}/grades`)
+export const renameTeacherGroup = (groupId: string, name: string) =>
+  request<TeacherGroup>(`/api/teacher/groups/${encodeURIComponent(groupId)}`, { method: 'PATCH', body: JSON.stringify({ name: name.trim() }) })
+export const deleteTeacherGroup = (groupId: string) => request<void>(`/api/teacher/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' })
+export const renameTeacherStudent = (studentId: string, firstName: string, lastName: string) =>
+  request<TeacherStudent>(`/api/teacher/students/${encodeURIComponent(studentId)}`, { method: 'PATCH', body: JSON.stringify({ firstName: firstName.trim(), lastName: lastName.trim() }) })
+export const deleteTeacherStudent = (studentId: string) => request<void>(`/api/teacher/students/${encodeURIComponent(studentId)}`, { method: 'DELETE' })
