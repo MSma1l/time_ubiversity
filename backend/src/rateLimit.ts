@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 
 export type RateLimiter = {
-  /** Returns the seconds to wait when the key is over the limit, or 0 when the hit is allowed. */
+  /** Returns the seconds to wait when the key is over the limit (or the limiter is full), or 0 when the hit is allowed. */
   hit(key: string, now?: number): number;
   size(): number;
   prune(now?: number): void;
@@ -17,8 +17,9 @@ export function createRateLimiter(limit: number, windowMs = 60_000, maxKeys = 50
       let bucket = buckets.get(key);
       if (!bucket || bucket.resetAt <= now) {
         if (!bucket && buckets.size >= maxKeys) prune(now);
-        // Still full after pruning: fail open rather than grow memory without bound.
-        if (!bucket && buckets.size >= maxKeys) return 0;
+        // Still full after pruning (only under a flood of distinct keys): reject instead of growing
+        // memory without bound. Failing closed keeps the limiter useful exactly when it is attacked.
+        if (!bucket && buckets.size >= maxKeys) return Math.max(1, Math.ceil(windowMs / 1000));
         bucket = { count: 0, resetAt: now + windowMs };
         buckets.set(key, bucket);
       }

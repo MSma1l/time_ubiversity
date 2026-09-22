@@ -1,8 +1,13 @@
 import type { Lesson, SqliteDatabase } from "./db.js";
 
 export type ProfileRole = Lesson["role"];
+/**
+ * No personal time zone: the timetable belongs to the university, so a student abroad still has the
+ * lesson at Chisinau time (schedule.ts) and a personal zone would only fire reminders at the wrong
+ * hour. The legacy `profiles.timezone` column is left untouched in existing databases and ignored.
+ */
 export type Profile = {
-  telegramId: number; displayName: string; role: ProfileRole; timezone: string;
+  telegramId: number; displayName: string; role: ProfileRole;
   studentEnabled: boolean; teacherEnabled: boolean; remindersEnabled: boolean;
 };
 export type ProfileChanges = { role?: ProfileRole; studentEnabled?: boolean; teacherEnabled?: boolean; remindersEnabled?: boolean };
@@ -18,7 +23,7 @@ export class ProfileRuleError extends Error {
   constructor(message: string) { super(message); this.name = "ProfileRuleError"; }
 }
 
-const PROFILE_COLUMNS = "telegram_id AS telegramId, display_name AS displayName, role, timezone, student_enabled AS studentEnabled, teacher_enabled AS teacherEnabled, reminders_enabled AS remindersEnabled";
+const PROFILE_COLUMNS = "telegram_id AS telegramId, display_name AS displayName, role, student_enabled AS studentEnabled, teacher_enabled AS teacherEnabled, reminders_enabled AS remindersEnabled";
 type ProfileRow = Omit<Profile, "studentEnabled" | "teacherEnabled" | "remindersEnabled"> & { studentEnabled: number, teacherEnabled: number, remindersEnabled: number };
 
 export function readProfile(db: SqliteDatabase, telegramId: number): Profile | undefined {

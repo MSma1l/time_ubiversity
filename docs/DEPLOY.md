@@ -25,7 +25,18 @@ curl -fsSL https://get.docker.com | sudo sh
 sudo usermod -aG docker "$USER"      # apoi deloghează-te și reloghează-te
 docker compose version               # trebuie să răspundă (v2)
 
-sudo apt install -y caddy git
+sudo apt install -y git
+
+# Caddy NU există în depozitele Ubuntu (`sudo apt install -y caddy` → „Unable to locate
+# package caddy"). Pașii oficiali Caddy pentru Debian/Ubuntu (depozitul Cloudsmith):
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update
+sudo apt install -y caddy
+caddy version
 
 sudo mkdir -p /opt/orar-univer && sudo chown "$USER": /opt/orar-univer
 git clone <URL-repository> /opt/orar-univer
@@ -70,12 +81,43 @@ nano backend/.env
 | `MINI_APP_URL` | `https://orar.exemplu.md` (trebuie `https://`, altfel `deploy.sh` eșuează) |
 | `ALLOWED_ORIGINS` | `https://orar.exemplu.md` (fără `/` final; mai multe origini separate prin virgulă) |
 | `ALLOW_DEV_AUTH` | `false` (cu `true` API-ul refuză să pornească în producție) |
-| `INIT_DATA_MAX_AGE_SECONDS` | `86400` implicit (60..2592000) |
+| `INIT_DATA_MAX_AGE_SECONDS` | `3600` implicit, adică o oră (interval acceptat: 60..604800). `initData` e o credențială de tip bearer, fără revocare — nu mări fereastra fără motiv |
 | `RATE_LIMIT_PER_MINUTE` | `120` implicit (`0` dezactivează) |
 | `TRUST_PROXY` | lasă valoarea implicită `loopback, linklocal, uniquelocal` |
+| `SEMESTERS` | calendarul academic, `START:even\|odd[:END]` separate prin virgulă (vezi 3.3). Gol = semestrul implicit |
 
-`NODE_ENV=production`, `PORT=3001`, `DATABASE_PATH=/data/orar.sqlite` și `DATABASE_URL` sunt
-**forțate de `docker-compose.yml`** și suprascriu ce scrii în `backend/.env`.
+`NODE_ENV=production`, `PORT=3001`, `HOST=0.0.0.0`, `DATABASE_PATH=/data/orar.sqlite` și
+`DATABASE_URL` sunt **forțate de `docker-compose.yml`** și suprascriu ce scrii în `backend/.env`.
+(`HOST` e forțat intenționat: cu `HOST=127.0.0.1` API-ul ar asculta doar în interiorul
+containerului — nginx ar da 502, iar health-check-ul ar rămâne verde.)
+
+### 3.3 `SEMESTERS` — calendarul academic
+
+Perioadele în care se țin cursuri. Fără ele, aplicația folosește un singur semestru implicit, fără
+sfârșit, început la `2026-09-07` pe săptămână pară — adică extrapolează la infinit.
+
+```ini
+SEMESTERS=2026-09-07:even:2026-12-20,2027-02-01:even:2027-05-30
+```
+
+| Regulă | Detaliu |
+|---|---|
+| `START` | trebuie să fie **luni** (prima luni a semestrului) și dă paritatea primei săptămâni |
+| `even` / `odd` | paritatea primei săptămâni; săptămânile 1, 3, 5 … o păstrează, 2, 4, 6 … o au pe cealaltă |
+| `END` | **inclusiv**; poate lipsi doar la ultima intrare (un semestru fără sfârșit înghite tot ce urmează) |
+| Suprapuneri | interzise; intrările sunt sortate automat după `START` |
+| Valoare greșită | API-ul **nu pornește**: afișează `Invalid configuration:` cu toate problemele găsite |
+
+Paritatea și numerotarea **repornesc la fiecare semestru**, deci vacanța de iarnă nu mai consumă
+paritate. În afara oricărui semestru orele rămân vizibile în orar, dar botul nu mai trimite memento-uri
+(la fel ca în sărbătorile legale, adăugate automat). Verifică după deploy:
+
+```bash
+curl -s "https://orar.exemplu.md/api/week?date=2026-09-14"   # necesită initData; vezi și logul de pornire
+```
+
+**Sarcină anuală:** actualizează `SEMESTERS` la începutul fiecărui an universitar, apoi
+`docker compose up -d api`. Variabila e citită la pornire.
 
 **Modul de primire a update-urilor — alege EXACT UNUL:**
 
@@ -155,6 +197,26 @@ cu `"postgres":"error"` vezi depanarea. Apoi deschide botul în Telegram, `/star
 cd /opt/orar-univer && ./deploy/deploy.sh --pull
 ```
 
+**Rollback la versiunea anterioară:**
+
+Înainte de fiecare build, `deploy.sh` retaghează imaginile curente ca `:prev`
+(`orar-univer-api:prev`, `orar-univer-web:prev`). Sunt imagini cu tag, deci `docker image prune -f`
+de la finalul scriptului **nu** le șterge. Revenire:
+
+```bash
+cd /opt/orar-univer
+docker tag orar-univer-api:prev orar-univer-api:latest
+docker tag orar-univer-web:prev orar-univer-web:latest
+docker compose up -d            # NU rula deploy.sh: ar reconstrui din codul curent
+docker compose ps               # postgres, api, web: (healthy)
+```
+
+Se păstrează o singură generație (`:prev`), deci rollback-ul funcționează doar imediat după un
+deploy nereușit — un al doilea build suprascrie `:prev` cu versiunea proastă. Dacă versiunea nouă
+a modificat schema bazei, restaurează și backup-ul făcut înainte (secțiunea 9, „Restaurare").
+Dacă vrei să revii și la codul sursă: `git log --oneline` + `git checkout <commit>` urmat de
+`./deploy/deploy.sh`.
+
 **Loguri:**
 ```bash
 docker compose logs -f api            # sau postgres / web
@@ -179,10 +241,108 @@ docker compose exec -T postgres pg_restore -U orar -d orar --clean --if-exists <
 
 # SQLite (profiluri, orar, notificări)
 docker compose stop api
-docker compose run --rm --no-deps -T --user root -v "$PWD/backups/<ts>:/restore:ro" --entrypoint sh api \
+# --cap-add CHOWN: serviciul api rulează cu cap_drop: [ALL], fără această capabilitate chown-ul final eșuează.
+docker compose run --rm --no-deps -T --user root --cap-add CHOWN -v "$PWD/backups/<ts>:/restore:ro" --entrypoint sh api \
   -c 'gunzip -c /restore/orar.sqlite.gz > /data/orar.sqlite && rm -f /data/orar.sqlite-wal /data/orar.sqlite-shm && chown node:node /data/orar.sqlite'
 docker compose start api
 ```
+
+### 9.1 Reîmprospătarea imaginilor de bază fixate pe digest
+
+Imaginile de bază sunt fixate pe digest-ul manifestului multi-arhitectură (`imagine:tag@sha256:...`),
+ca două build-uri ale aceluiași commit să producă aceleași straturi și un rollback să fie reproductibil.
+Tag-ul rămâne scris doar pentru lizibilitate — Docker folosește digest-ul.
+
+Efectul secundar: **un `docker build --pull` nu mai aduce patch-urile de securitate ale imaginii de
+bază.** Digest-ul trebuie ridicat manual. Fă pasul de mai jos **lunar** și imediat după o vulnerabilitate
+anunțată pentru Node, nginx, Alpine sau PostgreSQL.
+
+Locurile fixate (toate trebuie actualizate împreună — `node` apare de trei ori):
+
+| Fișier | Imagine |
+| --- | --- |
+| `backend/Dockerfile` (build + runtime) | `node:22-alpine` |
+| `frontend/Dockerfile` (build) | `node:22-alpine` |
+| `frontend/Dockerfile` (runtime) | `nginx:1.27-alpine` |
+| `docker-compose.yml` (`postgres`) | `postgres:16-alpine` |
+| `deploy/serverhome/compose.yaml` (`db`) | `postgres:16-alpine` |
+
+**1. Vezi ce e fixat acum:**
+```bash
+grep -rnE 'sha256:[0-9a-f]{64}' backend/Dockerfile frontend/Dockerfile docker-compose.yml deploy/serverhome/compose.yaml
+```
+
+**2. Află digest-ul curent al tag-ului** (dacă daemonul Docker rulează):
+```bash
+docker buildx imagetools inspect node:22-alpine | head -3      # linia "Digest:"
+docker buildx imagetools inspect nginx:1.27-alpine | head -3
+docker buildx imagetools inspect postgres:16-alpine | head -3
+```
+
+Fără daemon Docker (laptop, CI minimal), prin API-ul public de registry — funcționează cu `curl` simplu:
+```bash
+digest() {                       # digest() node 22-alpine
+  repo="library/$1"; tag="$2"
+  tok=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" \
+        | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  curl -sI -H "Authorization: Bearer $tok" \
+    -H 'Accept: application/vnd.oci.image.index.v1+json' \
+    -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+    "https://registry-1.docker.io/v2/${repo}/manifests/${tag}" | grep -i docker-content-digest
+}
+digest node 22-alpine
+digest nginx 1.27-alpine
+digest postgres 16-alpine
+```
+
+Trebuie cerut **digest-ul listei de manifeste** (antetele `Accept` de mai sus, `*.index` / `*.list`),
+nu al unei singure arhitecturi. Digest-ul listei merge și pe amd64 (VPS), și pe arm64 (Mac); un digest
+per-arhitectură face build-ul să eșueze pe cealaltă platformă cu „no match for platform".
+
+**3. Verifică digest-ul înainte să-l scrii în fișiere.** Un digest greșit nu se vede decât la
+următorul deploy, pe server. Cere manifestul înapoi *după digest* și confirmă că registry-ul
+răspunde cu exact același digest și că lista conține amd64 și arm64:
+```bash
+DIG=sha256:<digest-nou>; REPO=library/node        # sau library/nginx, library/postgres
+TOK=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" \
+      | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+curl -s -D - -o /tmp/man.json -H "Authorization: Bearer $TOK" \
+  -H 'Accept: application/vnd.oci.image.index.v1+json' \
+  -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+  "https://registry-1.docker.io/v2/${REPO}/manifests/${DIG}" | grep -i docker-content-digest
+shasum -a 256 /tmp/man.json                       # trebuie să dea același sha256 (Linux: sha256sum)
+grep -o '"architecture":"[^"]*"' /tmp/man.json | sort -u
+```
+Un 404 sau un sha256 diferit înseamnă digest greșit — **nu-l scrie în fișiere.**
+
+**4. Scrie noile digest-uri** în cele cinci locuri din tabel, păstrând forma `imagine:tag@sha256:...`.
+Dacă a apărut o versiune minoră nouă (ex. `nginx:1.28-alpine`), schimbă și tag-ul, nu doar digest-ul.
+
+**5. Verifică local înainte de deploy:**
+```bash
+docker compose -f docker-compose.yml config -q            # fără ieșire = OK
+docker compose -f deploy/serverhome/compose.yaml config -q
+docker compose build --no-cache api web                   # nu trebuie să apară "manifest unknown"
+docker compose up -d && docker compose ps                 # postgres, api, web: (healthy)
+curl -fsS http://127.0.0.1:8083/api/health                # {"ok":true,...}
+```
+
+**6. După deploy pe server** (`./deploy/deploy.sh --pull`): confirmă versiunile chiar din containere
+și că datele au supraviețuit:
+```bash
+docker compose exec api node -v                           # versiunea Node așteptată
+docker compose exec web nginx -v
+docker compose exec postgres postgres --version           # major NU trebuie să sară (16 → 17 cere migrare!)
+docker compose ps                                         # toate (healthy)
+```
+
+**Atenție la major-ul PostgreSQL:** un digest de la alt major (17) nu pornește peste un director de
+date inițializat cu 16 — containerul intră în restart loop cu „database files are incompatible with
+server". Rămâi pe `postgres:16-alpine` până faci o migrare planificată, cu backup (secțiunea 9).
+
+Commit separat, cu digest-urile și data reîmprospătării în mesaj, ca istoricul să arate ce versiune
+de bază rula la fiecare moment.
+
 
 ## 10. Migrare de la versiunea veche (IMPORTANT)
 

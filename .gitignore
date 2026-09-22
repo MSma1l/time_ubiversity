@@ -12,6 +12,9 @@ backend/.env
 backend/.env.*
 !backend/.env.example
 
+# Archives (no code snapshots in the repo: they become a second source of truth)
+*.zip
+
 # Local data and backups
 backend/data/
 backups/

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { openDatabase, pruneDatabase } from "./db.js";
+import { openDatabase, pruneDatabase, seedLegalHolidays, setNonWorkingDay } from "./db.js";
 import { minutesLabel } from "./labels.js";
 import { sendDueReminders } from "./reminders.js";
 import { TelegramApiError } from "./telegram.js";
@@ -90,10 +90,75 @@ describe("sendDueReminders", () => {
     expect(db.prepare("SELECT COUNT(*) AS c FROM lessons WHERE notifications_enabled=1").get()).toEqual({ c: 2 });
   });
 
-  it("prunes old reminder bookkeeping", () => {
-    const { db } = setup();
-    db.prepare("INSERT INTO delivered_reminders VALUES (1, '2026-08-01-08:00')").run();
-    expect(pruneDatabase(db, "2026-09-14").reminders).toBe(1);
+  it("does not resend when the start time is edited after the reminder went out", async () => {
+    const { db, insert } = setup();
+    insert.run(1, "student", "Fizică", null, 1, "08:00", "09:30", "every", 15);
+    const sent: string[] = [];
+    const send = async (_chatId: number, text: string) => { sent.push(text); };
+    expect(await sendDueReminders(db, send, AT_0745, silent)).toBe(1);
+    // The user moves the lesson to 08:10: its reminder moment (07:55) must not re-arm the same day.
+    db.prepare("UPDATE lessons SET start_time='08:10', end_time='09:40' WHERE id=1").run();
+    expect(await sendDueReminders(db, send, new Date(AT_0745.getTime() + 10 * 60_000), silent)).toBe(0);
+    expect(sent).toEqual(["🔔 În 15 minute: Fizică\n08:00–09:30"]);
+    expect(db.prepare("SELECT occurrence_key AS key FROM delivered_reminders").all()).toEqual([{ key: "2026-09-14" }]);
+    // The next occurrence, a week later, is a different day and is sent again.
+    expect(await sendDueReminders(db, send, new Date(AT_0745.getTime() + 7 * 1440 * 60_000 + 10 * 60_000), silent)).toBe(1);
+  });
+
+  it("recovers a reminder missed during a ten-minute restart, only once", async () => {
+    const { db, insert } = setup();
+    insert.run(1, "student", "Fizică", null, 1, "08:00", "09:30", "every", 15);
+    const sent: string[] = [];
+    const send = async (_chatId: number, text: string) => { sent.push(text); };
+    const at = (minutesAfter0745: number) => new Date(AT_0745.getTime() + minutesAfter0745 * 60_000);
+    // Process down from 07:44 to 07:54; the first tick back catches up with the real countdown.
+    expect(await sendDueReminders(db, send, at(9), silent)).toBe(1);
+    expect(await sendDueReminders(db, send, at(10), silent)).toBe(0);
+    expect(sent).toEqual(["🔔 În 6 minute: Fizică\n08:00–09:30"]);
+    expect(db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE kind='reminder'").get()).toEqual({ c: 1 });
+  });
+
+  it("prunes old reminder bookkeeping in both the current and the legacy key format", () => {
+    const { db, insert } = setup();
+    insert.run(1, "student", "Fizică", null, 1, "08:00", "09:30", "every", 15);
+    db.prepare("INSERT INTO delivered_reminders VALUES (1, '2026-08-01'), (1, '2026-08-01-08:00'), (1, '2026-09-14'), (1, '2026-08-31')").run();
+    // Keep-days is 14: the cutoff for 14 Sept is 31 Aug, so only the two August keys go.
+    expect(pruneDatabase(db, "2026-09-14").reminders).toBe(2);
+    expect(db.prepare("SELECT occurrence_key AS key FROM delivered_reminders ORDER BY key").all()).toEqual([{ key: "2026-08-31" }, { key: "2026-09-14" }]);
+  });
+
+  it("stays silent on a non-working day and outside every semester", async () => {
+    const { db, insert } = setup();
+    insert.run(1, "student", "Fizică", null, 1, "08:00", "09:30", "every", 15);
+    const send = async () => { throw new Error("nu trebuie trimis nimic"); };
+    // A day marked by an administrator: the lesson stays in the schedule, only the reminder is skipped.
+    setNonWorkingDay(db, "2026-09-14", "Vacanță de toamnă");
+    expect(await sendDueReminders(db, send, AT_0745, silent)).toBe(0);
+
+    const working = setup();
+    working.insert.run(1, "student", "Fizică", null, 1, "08:00", "09:30", "every", 15);
+    const previous = process.env.SEMESTERS;
+    try {
+      // The semester ended on 10 Sept 2026, so 14 Sept is between semesters — no reminder is due.
+      process.env.SEMESTERS = "2026-09-07:even:2026-09-10";
+      expect(await sendDueReminders(working.db, send, AT_0745, silent)).toBe(0);
+    } finally {
+      if (previous === undefined) delete process.env.SEMESTERS; else process.env.SEMESTERS = previous;
+    }
+    const sent: string[] = [];
+    expect(await sendDueReminders(working.db, async (_c, text) => { sent.push(text); }, AT_0745, silent)).toBe(1);
+  });
+
+  it("skips a seeded public holiday", async () => {
+    const { db, insert } = setup();
+    seedLegalHolidays(db, 2027);
+    // 1 January 2027 is a Friday (Anul Nou).
+    insert.run(1, "student", "Fizică", null, 5, "08:00", "09:30", "every", 15);
+    const send = async () => { throw new Error("nu trebuie trimis nimic"); };
+    expect(await sendDueReminders(db, send, new Date("2027-01-01T05:45:00Z"), silent)).toBe(0);
+    // A Friday in the same month without a holiday is an ordinary teaching day.
+    const sent: string[] = [];
+    expect(await sendDueReminders(db, async (_c, text) => { sent.push(text); }, new Date("2027-01-15T05:45:00Z"), silent)).toBe(1);
   });
 });
 
@@ -103,4 +168,5 @@ describe("minutesLabel", () => {
       "1 minut", "2 minute", "19 minute", "20 de minute", "101 minute", "119 minute", "120 de minute", "100 de minute"
     ]);
   });
+
 });

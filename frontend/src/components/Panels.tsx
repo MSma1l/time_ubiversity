@@ -5,7 +5,8 @@ import { initialOf, roleLabels, timingText } from '../labels'
 import { CheckIcon } from './LessonCard'
 import type { AppNotification, Lesson, Role, WeekType } from '../types'
 
-export function NotificationPanel({ items, onClose }: { items: AppNotification[], onClose(): void }) {
+/** `error` is shown here because the page notice stays behind this panel. */
+export function NotificationPanel({ items, error, onClose }: { items: AppNotification[], error?: string, onClose(): void }) {
   const dialogRef = useDialog<HTMLElement>(onClose)
   return <div className="modal-backdrop" role="presentation">
     <section ref={dialogRef} className="notification-panel" role="dialog" aria-modal="true" aria-labelledby="notifications-title" tabIndex={-1}>
@@ -13,6 +14,7 @@ export function NotificationPanel({ items, onClose }: { items: AppNotification[]
         <div><p>CENTRU NOTIFICĂRI</p><h2 id="notifications-title">Totul la zi</h2></div>
         <button type="button" onClick={onClose} aria-label="Închide">×</button>
       </div>
+      {error && <p className="error-notice profile-error" role="alert">⚠ {error}</p>}
       {items.length ? <div className="notification-list">
         {items.map((item) => <article className={`notification-item ${item.kind}`} key={item.id}>
           <span aria-hidden="true">{item.kind === 'reminder' ? '🔔' : '✓'}</span>
@@ -125,10 +127,12 @@ type ProfileProps = {
   name: string, role: Role, week: WeekType, enabled: Record<Role, boolean>, synced: boolean,
   /** Why the last role/mode change failed; shown here because the page notice is hidden behind the panel. */
   error?: string,
+  /** A role/mode change is still being saved: the controls stay disabled so a second tap is not lost silently. */
+  busy?: boolean,
   onClose(): void, onSwitchRole(): void, onToggle(role: Role): void, onOpenGroupSettings(): void,
 }
 
-export function ProfilePanel({ name, role, week, enabled, synced, error, onClose, onSwitchRole, onToggle, onOpenGroupSettings }: ProfileProps) {
+export function ProfilePanel({ name, role, week, enabled, synced, error, busy = false, onClose, onSwitchRole, onToggle, onOpenGroupSettings }: ProfileProps) {
   const dialogRef = useDialog<HTMLElement>(onClose)
   return <div className="modal-backdrop" role="presentation">
     <section ref={dialogRef} className="notification-panel profile-panel" role="dialog" aria-modal="true" aria-labelledby="profile-title" tabIndex={-1}>
@@ -138,10 +142,10 @@ export function ProfilePanel({ name, role, week, enabled, synced, error, onClose
       </div>
       <div className="profile-hero"><span aria-hidden="true">{initialOf(name)}</span><div><h3>{name || 'Utilizator'}</h3><p>{synced ? 'Conectat automat prin Telegram' : 'Neconectat — datele nu se sincronizează'}</p></div></div>
       {error && <p className="error-notice profile-error" role="alert">⚠ {error}</p>}
-      <div className="profile-setting"><div><strong>Rol activ</strong><p>{roleLabels[role]}</p></div><button type="button" onClick={onSwitchRole}>Schimbă rolul</button></div>
+      <div className="profile-setting"><div><strong>Rol activ</strong><p>{roleLabels[role]}</p></div><button type="button" onClick={onSwitchRole} disabled={busy} aria-busy={busy}>{busy ? 'Se salvează…' : 'Schimbă rolul'}</button></div>
       {(['student', 'teacher'] as const).map((kind) => <div className="profile-setting" key={kind}>
         <div><strong>Mod {roleLabels[kind]}</strong><p>{enabled[kind] ? (kind === 'student' ? 'Activ — vezi orele tale' : 'Activ — gestionezi orele') : 'Dezactivat'}</p></div>
-        <button type="button" className={`status-toggle ${enabled[kind] ? 'on' : ''}`} onClick={() => onToggle(kind)} aria-pressed={enabled[kind]} aria-label={`Mod ${roleLabels[kind]}`}><i /></button>
+        <button type="button" className={`status-toggle ${enabled[kind] ? 'on' : ''}`} onClick={() => onToggle(kind)} aria-pressed={enabled[kind]} disabled={busy} aria-busy={busy} aria-label={`Mod ${roleLabels[kind]}`}><i /></button>
       </div>)}
       {role === 'teacher' && <button type="button" className="profile-setting group-settings-link" onClick={onOpenGroupSettings}><span className="setting-icon" aria-hidden="true">⚙</span><div><strong>Setări grupe</strong><p>Grupe, studenți, prezență și note</p></div><span aria-hidden="true">›</span></button>}
       <div className="profile-setting"><div><strong>Paritatea săptămânii</strong><p>Calcul automat: săptămâna aceasta este {weekTypeLabels[week]}</p></div><span className="auto-dot">AUTO</span></div>

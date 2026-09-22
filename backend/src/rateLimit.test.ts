@@ -17,4 +17,14 @@ describe("createRateLimiter", () => {
     limiter.hit("c", 2_000);
     expect(limiter.size()).toBe(1);
   });
+  it("rejects new keys instead of failing open when it is full", () => {
+    const limiter = createRateLimiter(5, 60_000, 2);
+    expect(limiter.hit("a", 0)).toBe(0);
+    expect(limiter.hit("b", 0)).toBe(0);
+    expect(limiter.hit("c", 0)).toBe(60);
+    expect(limiter.size()).toBe(2);
+    // Keys already counted keep working, and memory stays capped.
+    expect(limiter.hit("a", 0)).toBe(0);
+    expect(limiter.size()).toBe(2);
+  });
 });

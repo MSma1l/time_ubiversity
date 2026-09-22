@@ -1,5 +1,6 @@
-import { normalizeTime, universityClock } from './schedule'
-import type { AppNotification, Lesson, Role } from './types'
+import { isValidIsoDate, normalizeTime, universityClock } from './schedule'
+import type { Semester } from './schedule'
+import type { AppNotification, Lesson, Role, WeekType } from './types'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '').replace(/\/+$/, '')
 const REQUEST_TIMEOUT_MS = 15_000
@@ -54,6 +55,9 @@ function messageForStatus(status: number, body: ErrorBody | null, fields: FieldE
   return serverMessage || 'Cererea nu a reușit. Încearcă din nou.'
 }
 
+/** The request was cut short by the timeout (fetch and the body read both reject with AbortError). */
+const aborted = (error: unknown) => error instanceof DOMException && error.name === 'AbortError'
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
   if (options.body !== undefined) headers.set('Content-Type', 'application/json')
@@ -63,26 +67,29 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   const controller = new AbortController()
   const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
-  let response: Response
+  // The timeout covers the body too: a connection that stalls after the headers must not hang the caller forever.
   try {
-    response = await fetch(`${apiBase}${path}`, { ...options, headers, signal: controller.signal })
-  } catch (error) {
-    const timedOut = error instanceof DOMException && error.name === 'AbortError'
-    throw new ApiError(timedOut ? 'Serverul nu răspunde. Încearcă din nou.' : 'Nu există conexiune cu serverul. Verifică internetul și încearcă din nou.', 0)
+    let response: Response
+    try {
+      response = await fetch(`${apiBase}${path}`, { ...options, headers, signal: controller.signal })
+    } catch (error) {
+      throw new ApiError(aborted(error) ? 'Serverul nu răspunde. Încearcă din nou.' : 'Nu există conexiune cu serverul. Verifică internetul și încearcă din nou.', 0)
+    }
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as ErrorBody | null
+      const fields = response.status === 400 ? fieldErrors(body) : []
+      throw new ApiError(messageForStatus(response.status, body, fields), response.status, fields)
+    }
+    if (response.status === 204) return undefined as T
+    try {
+      return await response.json() as T
+    } catch (error) {
+      if (aborted(error)) throw new ApiError('Serverul nu răspunde. Încearcă din nou.', 0)
+      throw new ApiError('Serverul a trimis un răspuns neașteptat.', response.status)
+    }
   } finally {
     window.clearTimeout(timer)
-  }
-
-  if (!response.ok) {
-    const body = await response.json().catch(() => null) as ErrorBody | null
-    const fields = response.status === 400 ? fieldErrors(body) : []
-    throw new ApiError(messageForStatus(response.status, body, fields), response.status, fields)
-  }
-  if (response.status === 204) return undefined as T
-  try {
-    return await response.json() as T
-  } catch {
-    throw new ApiError('Serverul a trimis un răspuns neașteptat.', response.status)
   }
 }
 
@@ -90,6 +97,9 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export function errorMessage(error: unknown, fallback: string) {
   return error instanceof ApiError ? error.message : fallback
 }
+
+/** 401/403 from any request: the Telegram `initData` is no longer valid and nothing can be saved until the app is reopened. */
+export const isSessionExpired = (error: unknown) => error instanceof ApiError && (error.status === 401 || error.status === 403)
 
 type ApiLesson = { id: number, role: Role, title: string, groupName: string | null, teacherName: string | null, room: string | null, weekday: number, startTime: string, endTime: string, weekKind: 'odd' | 'even' | 'every', reminderMinutes: number, notificationsEnabled?: boolean | number }
 
@@ -125,6 +135,36 @@ export async function loadAccount() {
   ])
   return { profile: normalizeProfile(me.profile ?? {}), lessons: items.map(fromApi), notifications }
 }
+
+export type NonWorkingDay = { date: string, label: string }
+/** What `GET /api/week` tells the app: the calendar it must compute parity with, plus the week's days off. */
+export type WeekCalendar = { date: string, semesters: Semester[], nonWorkingDays: NonWorkingDay[] }
+
+type ApiSemester = { start?: unknown, kind?: unknown, end?: unknown }
+type ApiWeek = {
+  date?: unknown, semesters?: unknown, nonWorkingDays?: unknown
+  /** Older backends describe a single open-ended anchor instead of a semester list. */
+  referenceMonday?: unknown, referenceKind?: unknown
+}
+const isWeekType = (value: unknown): value is WeekType => value === 'even' || value === 'odd'
+
+/** Anything the server did not send (or sent malformed) is dropped; the caller then keeps the built-in default. */
+function normalizeWeek(body: ApiWeek): WeekCalendar {
+  const list = (Array.isArray(body.semesters) ? body.semesters : []) as ApiSemester[]
+  const semesters: Semester[] = list
+    .filter((item) => Boolean(item) && isValidIsoDate(item.start) && isWeekType(item.kind))
+    .map((item) => ({ start: item.start as string, kind: item.kind as WeekType, end: isValidIsoDate(item.end) ? item.end : null }))
+  if (!semesters.length && isValidIsoDate(body.referenceMonday) && isWeekType(body.referenceKind)) semesters.push({ start: body.referenceMonday, kind: body.referenceKind, end: null })
+  const days = (Array.isArray(body.nonWorkingDays) ? body.nonWorkingDays : []) as Array<{ date?: unknown, label?: unknown }>
+  const nonWorkingDays = days
+    .filter((item) => Boolean(item) && isValidIsoDate(item.date))
+    .map((item) => ({ date: item.date as string, label: (typeof item.label === 'string' && item.label.trim()) || 'Zi nelucrătoare' }))
+  return { date: isValidIsoDate(body.date) ? body.date : universityClock().isoDate, semesters, nonWorkingDays }
+}
+
+/** Academic calendar around `date` (default: today): the configured semesters and the non-working days of that week. */
+export const loadWeekCalendar = async (date?: string) =>
+  normalizeWeek(await request<ApiWeek>(`/api/week${date ? `?date=${encodeURIComponent(date)}` : ''}`))
 
 export async function saveLessonRemote(lesson: Lesson) {
   return fromApi(await request<ApiLesson>('/api/lessons', { method: 'POST', body: toApi(lesson) }))
@@ -177,8 +217,8 @@ export type TeacherStudent = { id: string, first_name: string, last_name: string
 export type AttendanceStatus = 'present' | 'absent' | 'late'
 
 export const loadTeacherGroups = async () => (await request<ApiTeacherGroup[]>('/api/teacher/groups')).map(fromApiGroup)
-export const createTeacherGroup = (name: string, subject: string) =>
-  request<TeacherGroup>('/api/teacher/groups', { method: 'POST', body: JSON.stringify({ name: name.trim(), subject: subject.trim() || undefined }) })
+export const createTeacherGroup = async (name: string, subject: string) =>
+  fromApiGroup(await request<ApiTeacherGroup>('/api/teacher/groups', { method: 'POST', body: JSON.stringify({ name: name.trim(), subject: subject.trim() || undefined }) }))
 export const loadTeacherStudents = (groupId: string) => request<TeacherStudent[]>(`/api/teacher/groups/${encodeURIComponent(groupId)}/students`)
 export const createTeacherStudent = (groupId: string, firstName: string, lastName: string) =>
   request<TeacherStudent>(`/api/teacher/groups/${encodeURIComponent(groupId)}/students`, { method: 'POST', body: JSON.stringify({ firstName: firstName.trim(), lastName: lastName.trim() }) })
@@ -196,8 +236,8 @@ export type SavedAttendance = { date: string, sessionId: string | null, topic: s
 export const loadAttendance = (groupId: string, date = universityClock().isoDate) =>
   request<SavedAttendance>(`/api/teacher/groups/${encodeURIComponent(groupId)}/attendance?date=${encodeURIComponent(date)}`)
 export const loadLabGrades = (studentId: string) => request<LabGrade[]>(`/api/teacher/students/${encodeURIComponent(studentId)}/grades`)
-export const renameTeacherGroup = (groupId: string, name: string) =>
-  request<TeacherGroup>(`/api/teacher/groups/${encodeURIComponent(groupId)}`, { method: 'PATCH', body: JSON.stringify({ name: name.trim() }) })
+export const renameTeacherGroup = async (groupId: string, name: string) =>
+  fromApiGroup(await request<ApiTeacherGroup>(`/api/teacher/groups/${encodeURIComponent(groupId)}`, { method: 'PATCH', body: JSON.stringify({ name: name.trim() }) }))
 export const deleteTeacherGroup = (groupId: string) => request<void>(`/api/teacher/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' })
 export const renameTeacherStudent = (studentId: string, firstName: string, lastName: string) =>
   request<TeacherStudent>(`/api/teacher/students/${encodeURIComponent(studentId)}`, { method: 'PATCH', body: JSON.stringify({ firstName: firstName.trim(), lastName: lastName.trim() }) })

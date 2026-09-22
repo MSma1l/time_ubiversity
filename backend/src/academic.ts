@@ -4,23 +4,43 @@ import { sleep } from "./util.js";
 export type AcademicStatus = "disabled" | "connecting" | "ready" | "error";
 
 let pool: Pool | undefined;
+let poolUrl: string | undefined;
+let mismatchWarned: string | undefined;
 let schemaReady: Promise<void> | undefined;
 let status: AcademicStatus = "disabled";
 
-/** `databaseUrl` comes from `AppConfig.databaseUrl` (the single source of truth); empty disables the catalog. */
+/** A query may not hold one of the 10 pooled connections forever (and keep /health reporting "ready"). */
+const QUERY_TIMEOUT_MS = 10_000;
+
+/**
+ * `databaseUrl` comes from `AppConfig.databaseUrl` (the single source of truth); empty disables the catalog.
+ * The pool is created once per process: a later, different URL cannot be applied (it would orphan the open
+ * connections), so it is reported instead of silently ignored.
+ */
 export function academicDatabase(databaseUrl: string) {
   const url = databaseUrl.trim();
   if (!url) return undefined;
   if (!pool) {
-    pool = new Pool({ connectionString: url, max: 10, connectionTimeoutMillis: 5_000, idleTimeoutMillis: 30_000 });
+    pool = new Pool({
+      connectionString: url, max: 10, connectionTimeoutMillis: 5_000, idleTimeoutMillis: 30_000,
+      statement_timeout: QUERY_TIMEOUT_MS, query_timeout: QUERY_TIMEOUT_MS
+    });
+    poolUrl = url;
+    mismatchWarned = undefined;
     // Without a listener, an idle client error (e.g. PostgreSQL restart) would crash the process.
     pool.on("error", (error) => console.error("PostgreSQL pool error:", error.message));
     status = "connecting";
+  } else if (url !== poolUrl && url !== mismatchWarned) {
+    mismatchWarned = url;
+    console.warn("PostgreSQL: DATABASE_URL changed after the pool was created; the existing pool keeps the first URL. Restart the process to apply the new one.");
   }
   return pool;
 }
 
-const SCHEMA_SQL = `CREATE TABLE IF NOT EXISTS academic_groups (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id BIGINT NOT NULL, name VARCHAR(80) NOT NULL, subject VARCHAR(120), created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(owner_id,name));
+// pgcrypto is only built in from PostgreSQL 13; without it every gen_random_uuid() default fails and
+// the schema is retried forever. Must stay the first statement of the schema.
+const SCHEMA_SQL = `CREATE EXTENSION IF NOT EXISTS pgcrypto;
+    CREATE TABLE IF NOT EXISTS academic_groups (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id BIGINT NOT NULL, name VARCHAR(80) NOT NULL, subject VARCHAR(120), created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(owner_id,name));
     CREATE TABLE IF NOT EXISTS students (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), group_id UUID NOT NULL REFERENCES academic_groups(id) ON DELETE CASCADE, first_name VARCHAR(80) NOT NULL, last_name VARCHAR(80) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
     CREATE TABLE IF NOT EXISTS attendance_sessions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), group_id UUID NOT NULL REFERENCES academic_groups(id) ON DELETE CASCADE, occurred_on DATE NOT NULL, topic VARCHAR(160), created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(group_id,occurred_on));
     CREATE TABLE IF NOT EXISTS attendance_entries (session_id UUID NOT NULL REFERENCES attendance_sessions(id) ON DELETE CASCADE, student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE, status VARCHAR(12) NOT NULL CHECK(status IN ('present','absent','late')), PRIMARY KEY(session_id,student_id));
@@ -143,6 +163,8 @@ export async function academicHealth(databaseUrl: string): Promise<{ status: Aca
 export async function closeAcademicDatabase() {
   const current = pool;
   pool = undefined;
+  poolUrl = undefined;
+  mismatchWarned = undefined;
   schemaReady = undefined;
   status = "disabled";
   if (current) await current.end();

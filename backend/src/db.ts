@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { isoDateInChisinau, legalHolidays, type NonWorkingDay } from "./schedule.js";
 
 export type Lesson = {
   id: number; ownerId: number; role: "student" | "teacher"; title: string; groupName: string | null;
@@ -18,16 +19,24 @@ export function openDatabase(path: string): SqliteDatabase {
   db.pragma("synchronous = NORMAL");
   db.pragma("busy_timeout = 5000");
   db.pragma("foreign_keys = ON");
-  db.exec(`CREATE TABLE IF NOT EXISTS profiles (telegram_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'student', timezone TEXT NOT NULL DEFAULT 'Europe/Chisinau');
+  db.exec(`CREATE TABLE IF NOT EXISTS profiles (telegram_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'student');
     CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, role TEXT NOT NULL, title TEXT NOT NULL, group_name TEXT, teacher_name TEXT, room TEXT, weekday INTEGER NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL, week_kind TEXT NOT NULL DEFAULT 'every', reminder_minutes INTEGER NOT NULL DEFAULT 15, notifications_enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS delivered_reminders (lesson_id INTEGER NOT NULL, occurrence_key TEXT NOT NULL, PRIMARY KEY (lesson_id, occurrence_key));
     CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, read_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, role TEXT);
     -- Owners whose existing teacher-lesson groups were imported once into the Teacher Catalog (groupSync.ts).
-    CREATE TABLE IF NOT EXISTS catalog_group_sync (owner_id INTEGER PRIMARY KEY, synced_at TEXT NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS catalog_group_sync (owner_id INTEGER PRIMARY KEY, synced_at TEXT NOT NULL);
+    -- Days without classes: public holidays (seeded) and anything an administrator adds (a holiday
+    -- break, a rehabilitation day). Periods between semesters are NOT listed here — they follow from
+    -- the semester model in schedule.ts, so no one has to enumerate the summer.
+    CREATE TABLE IF NOT EXISTS non_working_days (date TEXT PRIMARY KEY, label TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'custom');
+    -- Which years were already seeded, so a holiday an administrator deleted on purpose is not resurrected.
+    CREATE TABLE IF NOT EXISTS non_working_seeds (year INTEGER PRIMARY KEY, seeded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
   migrateLegacySchema(db);
   db.exec(`CREATE INDEX IF NOT EXISTS lessons_owner_idx ON lessons(owner_id, weekday, start_time);
     CREATE INDEX IF NOT EXISTS lessons_weekday_idx ON lessons(weekday) WHERE notifications_enabled=1;
     CREATE INDEX IF NOT EXISTS notifications_owner_idx ON notifications(owner_id, id);`);
+  seedLegalHolidays(db, currentYear());
+  seedLegalHolidays(db, currentYear() + 1);
   return db;
 }
 
@@ -108,4 +117,42 @@ export function pruneDatabase(db: SqliteDatabase, today: string, reminderKeepDay
   const reminders = db.prepare("DELETE FROM delivered_reminders WHERE occurrence_key < ? OR lesson_id NOT IN (SELECT id FROM lessons)").run(cutoff(reminderKeepDays)).changes;
   const notifications = db.prepare("DELETE FROM notifications WHERE created_at < ?").run(cutoff(notificationKeepDays)).changes;
   return { reminders, notifications };
+}
+
+const currentYear = () => Number(isoDateInChisinau().slice(0, 4));
+
+/**
+ * Adds the public holidays of one year, once. Idempotent twice over: the year is recorded in
+ * `non_working_seeds` (a second call does nothing, even if rows were edited or removed afterwards)
+ * and the insert itself ignores dates already present, so a custom entry is never overwritten.
+ */
+export function seedLegalHolidays(db: SqliteDatabase, year: number): number {
+  return db.transaction(() => {
+    if (!db.prepare("INSERT OR IGNORE INTO non_working_seeds (year) VALUES (?)").run(year).changes) return 0;
+    const insert = db.prepare("INSERT OR IGNORE INTO non_working_days (date, label, source) VALUES (?,?,'holiday')");
+    let added = 0;
+    for (const day of legalHolidays(year)) added += insert.run(day.date, day.label).changes;
+    return added;
+  })();
+}
+
+/** Labels of the given dates that are non-working — one query, for the reminder tick. */
+export function nonWorkingDays(db: SqliteDatabase, dates: string[]): Map<string, string> {
+  if (!dates.length) return new Map();
+  const rows = db.prepare(`SELECT date, label FROM non_working_days WHERE date IN (${dates.map(() => "?").join(",")})`).all(...dates) as NonWorkingDay[];
+  return new Map(rows.map((row) => [row.date, row.label]));
+}
+
+/** Non-working days of a closed date range, oldest first (the calendar marks them). */
+export function nonWorkingDaysBetween(db: SqliteDatabase, from: string, to: string): NonWorkingDay[] {
+  return db.prepare("SELECT date, label FROM non_working_days WHERE date BETWEEN ? AND ? ORDER BY date").all(from, to) as NonWorkingDay[];
+}
+
+/** Adds or renames a non-working day entered by an administrator. */
+export function setNonWorkingDay(db: SqliteDatabase, date: string, label: string) {
+  db.prepare("INSERT INTO non_working_days (date, label, source) VALUES (?,?,'custom') ON CONFLICT(date) DO UPDATE SET label=excluded.label").run(date, label);
+}
+
+export function removeNonWorkingDay(db: SqliteDatabase, date: string): boolean {
+  return db.prepare("DELETE FROM non_working_days WHERE date=?").run(date).changes > 0;
 }

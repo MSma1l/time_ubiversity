@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { academicDatabase, ensureAcademicSchema, isConnectionError, resetAcademicSchema } from "./academic.js";
 import type { Lesson, SqliteDatabase } from "./db.js";
 
@@ -12,17 +12,33 @@ import type { Lesson, SqliteDatabase } from "./db.js";
  * - Lessons that existed before this feature are imported once per owner (backfill, tracked in the SQLite
  *   table `catalog_group_sync`). Groups the teacher deletes afterwards are not re-imported by the backfill;
  *   only a later save of a lesson with that group recreates it.
- * - Renaming a catalog group never changes lessons, and deleting a group never deletes lessons: the
- *   catalog is the teacher's register, the schedule stays untouched.
+ * - Renaming a catalog group renames the group in the owner's Profesor lessons too (`renameLessonGroup`):
+ *   the link follows the name, so without it the schedule would keep pointing at a name the catalog no
+ *   longer has and the next lesson save would recreate that name as an empty duplicate group.
+ * - Deleting a group never deletes lessons: the catalog is the teacher's register, the schedule stays.
  */
 
 type WarnLog = Pick<Console, "warn">;
 type LessonGroupSource = Pick<Lesson, "groupName" | "title">;
+type Queryable = Pick<PoolClient, "query">;
 
 const GROUP_NAME_MAX = 80;
 const SUBJECT_MAX = 120;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+/**
+ * PostgreSQL advisory lock namespaces of the catalog: 727274001 schema creation (academic.ts), 727274002
+ * the catalog writes of one owner, 727274003 the writes inside one group. A transaction takes at most one
+ * of them and never calls code that takes another, so they cannot deadlock each other.
+ */
 const SYNC_LOCK_NAMESPACE = 727274002;
+const GROUP_LOCK_NAMESPACE = 727274003;
+
+/** Serialises the catalog writes of one owner (group creation, rename, lesson sync). Needs an open transaction. */
+export const lockOwnerCatalog = (client: Queryable, ownerId: number) =>
+  client.query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))", [SYNC_LOCK_NAMESPACE, String(ownerId)]);
+/** Serialises the writes inside one group (student creation). Needs an open transaction. */
+export const lockCatalogGroup = (client: Queryable, groupId: string) =>
+  client.query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))", [GROUP_LOCK_NAMESPACE, groupId]);
 
 /** Matching key for lesson and catalog group names: trimmed, case-insensitive. Empty means "no group". */
 export function groupKey(name: string | null | undefined): string {
@@ -41,7 +57,8 @@ export function collectGroupCandidates(lessons: LessonGroupSource[]): GroupCandi
     const name = lesson.groupName?.trim() ?? "";
     const key = groupKey(name);
     if (!key || seen.has(key) || name.length > GROUP_NAME_MAX || CONTROL_CHARACTERS.test(name)) continue;
-    const subject = lesson.title.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, SUBJECT_MAX).trim();
+    // Sliced by code points: cutting UTF-16 units would split a surrogate pair (emoji) into "�".
+    const subject = [...lesson.title.replace(/[\u0000-\u001f\u007f]/g, " ").trim()].slice(0, SUBJECT_MAX).join("").trim();
     seen.set(key, { name, subject: subject || null });
   }
   return [...seen.values()];
@@ -79,24 +96,49 @@ export function withLessonLinks<T extends { name: string }>(group: T, links: Map
 export const ownerLessonLinks = (db: SqliteDatabase, ownerId: number) => computeLessonLinks(teacherLessonGroups(db, ownerId));
 
 /**
+ * Applies a catalog group rename to the owner's Profesor lessons: every teacher lesson whose group matches
+ * the old name (same `groupKey`: trimmed, case-insensitive) gets the new spelling, in one SQLite
+ * transaction. Matching is done in JavaScript on purpose — SQLite's `lower()` only folds ASCII, so a SQL
+ * comparison would silently miss names with diacritics that `groupKey` considers equal. A rename that only
+ * changes letter case still rewrites the text shown in the schedule. The Student schedule is never touched.
+ * Returns how many lessons changed.
+ */
+export function renameLessonGroup(db: SqliteDatabase, ownerId: number, previousName: string, nextName: string): number {
+  const key = groupKey(previousName);
+  const name = nextName.trim();
+  if (!key || !name) return 0;
+  const rows = db.prepare("SELECT id, group_name AS groupName FROM lessons WHERE owner_id=? AND role='teacher' AND group_name IS NOT NULL")
+    .all(ownerId) as Array<{ id: number, groupName: string }>;
+  const ids = rows.filter((row) => groupKey(row.groupName) === key && row.groupName !== name).map((row) => row.id);
+  if (!ids.length) return 0;
+  const update = db.prepare("UPDATE lessons SET group_name=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND owner_id=?");
+  db.transaction(() => { for (const id of ids) update.run(name, id, ownerId); })();
+  return ids.length;
+}
+
+export type CatalogSyncResult = { created: string[], skipped: number };
+
+/**
  * Creates the catalog groups that are missing for the owner (case-insensitive), respecting the per-owner
  * group limit; extra names are skipped with a log line. Works with and without the case-insensitive unique
- * index (legacy duplicates): NOT EXISTS on lower(name) plus ON CONFLICT DO NOTHING. Returns created names.
+ * index (legacy duplicates): NOT EXISTS on lower(name) plus ON CONFLICT DO NOTHING. Returns the created
+ * names and how many groups the limit left out, so the caller can tell a complete import from a partial one.
  */
-export async function ensureCatalogGroups(pg: Pool, ownerId: number, candidates: GroupCandidate[], limit: number, log: WarnLog = console): Promise<string[]> {
-  if (!candidates.length) return [];
+export async function ensureCatalogGroups(pg: Pool, ownerId: number, candidates: GroupCandidate[], limit: number, log: WarnLog = console): Promise<CatalogSyncResult> {
+  if (!candidates.length) return { created: [], skipped: 0 };
   const client = await pg.connect();
   try {
     await client.query("BEGIN");
-    // Serialises syncs of the same owner (lesson saves, backfill) so the limit and duplicates stay consistent.
-    await client.query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))", [SYNC_LOCK_NAMESPACE, String(ownerId)]);
+    // Serialises syncs of the same owner (lesson saves, backfill, group create/rename) so the limit and
+    // duplicates stay consistent.
+    await lockOwnerCatalog(client, ownerId);
     const names = candidates.map((candidate) => candidate.name);
     const subjects = candidates.map((candidate) => candidate.subject);
     const missing = await client.query(`SELECT t.name, t.subject FROM unnest($2::text[], $3::text[]) WITH ORDINALITY AS t(name, subject, ord)
       WHERE NOT EXISTS (SELECT 1 FROM academic_groups g WHERE g.owner_id=$1 AND lower(g.name)=lower(t.name)) ORDER BY t.ord`, [ownerId, names, subjects]);
     if (!missing.rowCount) {
       await client.query("COMMIT");
-      return [];
+      return { created: [], skipped: 0 };
     }
     const count = (await client.query("SELECT COUNT(*)::int AS count FROM academic_groups WHERE owner_id=$1", [ownerId])).rows[0].count as number;
     const free = Math.max(limit - count, 0);
@@ -113,7 +155,7 @@ export async function ensureCatalogGroups(pg: Pool, ownerId: number, candidates:
       created = inserted.rows.map((row) => row.name as string);
     }
     await client.query("COMMIT");
-    return created;
+    return { created, skipped: skipped.length };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
     throw error;
@@ -127,11 +169,17 @@ export const isOwnerSynced = (db: SqliteDatabase, ownerId: number) =>
 
 /**
  * One-time import of the groups of the owner's existing teacher lessons. Marks the owner as synced only
- * after the catalog write succeeded, so a failure is retried on the next call. Returns true if it ran.
+ * after a *complete* catalog write: a failure is retried on the next call, and so is an import the
+ * per-owner group limit truncated (otherwise the skipped groups would never be imported, not even with a
+ * larger limit). Returns true if it ran.
  */
 export async function backfillOwnerGroups(db: SqliteDatabase, pg: Pool, ownerId: number, limit: number, log: WarnLog = console): Promise<boolean> {
   if (isOwnerSynced(db, ownerId)) return false;
-  await ensureCatalogGroups(pg, ownerId, collectGroupCandidates(teacherLessonGroups(db, ownerId)), limit, log);
+  const { skipped } = await ensureCatalogGroups(pg, ownerId, collectGroupCandidates(teacherLessonGroups(db, ownerId)), limit, log);
+  if (skipped) {
+    log.warn(`Catalog group backfill for owner ${ownerId} is incomplete (${skipped} group(s) over the limit): the owner stays unsynced and the import is retried later`);
+    return true;
+  }
   db.prepare("INSERT OR IGNORE INTO catalog_group_sync(owner_id, synced_at) VALUES (?, ?)").run(ownerId, new Date().toISOString());
   return true;
 }

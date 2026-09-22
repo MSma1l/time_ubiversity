@@ -106,8 +106,8 @@ export function LessonEditor({ role, existing, slot, onClose, onSave, onDelete, 
     fail('')
     setBusy(true)
     const failure = await onDelete()
-    if (failure) showFailure(failure)
-    setBusy(false)
+    // On success the parent closes (unmounts) the editor, so only the failure path touches the state again.
+    if (failure) { showFailure(failure); setBusy(false) }
   }
 
   return <div className="modal-backdrop" role="presentation">

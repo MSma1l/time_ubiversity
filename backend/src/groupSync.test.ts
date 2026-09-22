@@ -5,7 +5,7 @@ import { closeAcademicDatabase } from "./academic.js";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { openDatabase } from "./db.js";
-import { collectGroupCandidates, computeLessonLinks, groupKey, isOwnerSynced, ownerLessonLinks, teacherLessonGroups, withLessonLinks } from "./groupSync.js";
+import { collectGroupCandidates, computeLessonLinks, groupKey, isOwnerSynced, ownerLessonLinks, renameLessonGroup, teacherLessonGroups, withLessonLinks } from "./groupSync.js";
 
 const lesson = (groupName: string | null, title: string) => ({ groupName, title });
 
@@ -24,6 +24,13 @@ describe("lesson ↔ catalog group matching", () => {
       lesson(null, "Fără grupă"), lesson("   ", "Gol"), lesson("x".repeat(81), "Prea lung"), lesson("Bad\u0001", "Control")
     ]);
     expect(candidates).toEqual([{ name: "IBM-261", subject: "PC" }, { name: "R-261", subject: "PC" }, { name: "Sad-262", subject: "TPA" }]);
+  });
+
+  it("truncates the subject on code points, never inside a surrogate pair", () => {
+    const [group] = collectGroupCandidates([lesson("IBM-261", `${"x".repeat(119)}\u{1F600} restul titlului`)]);
+    expect([...group.subject!].length).toBe(120);
+    expect(group.subject!.endsWith("\u{1F600}")).toBe(true);
+    expect(group.subject).not.toMatch(/[\uD800-\uDFFF]/u); // no lone surrogate ("\uFFFD" in PostgreSQL)
   });
 
   it("computes linkedLessons and sorted distinct subjects per group", () => {
@@ -48,6 +55,34 @@ describe("lesson ↔ catalog group matching", () => {
     db.prepare("INSERT INTO catalog_group_sync(owner_id, synced_at) VALUES (1, 'now')").run();
     expect(isOwnerSynced(db, 1)).toBe(true);
     openDatabase(":memory:"); // migration is idempotent on a fresh database too
+  });
+
+  it("renames the group only in the owner's teacher lessons, matching like groupKey", () => {
+    const db = openDatabase(":memory:");
+    const insert = db.prepare("INSERT INTO lessons (owner_id,role,title,group_name,weekday,start_time,end_time) VALUES (?,?,?,?,1,'08:00','09:30')");
+    insert.run(1, "teacher", "TPA", "Sad-262");
+    insert.run(1, "teacher", "Laborator TPA", " sad-262 ");
+    insert.run(1, "teacher", "PC", "IBM-261");
+    insert.run(1, "student", "Fizică", "Sad-262");
+    insert.run(2, "teacher", "TPA", "Sad-262");
+    const names = (ownerId: number, role: string) =>
+      (db.prepare("SELECT group_name AS groupName FROM lessons WHERE owner_id=? AND role=? ORDER BY id").all(ownerId, role) as Array<{ groupName: string | null }>).map((row) => row.groupName);
+
+    expect(renameLessonGroup(db, 1, "SAD-262", "SAD-262 A")).toBe(2);
+    expect(names(1, "teacher")).toEqual(["SAD-262 A", "SAD-262 A", "IBM-261"]);
+    expect(names(1, "student")).toEqual(["Sad-262"]); // the Student schedule is never touched
+    expect(names(2, "teacher")).toEqual(["Sad-262"]); // another owner is never touched
+    expect(ownerLessonLinks(db, 1).get("sad-262 a")).toEqual({ linkedLessons: 2, subjects: ["Laborator TPA", "TPA"] });
+
+    // A rename that only changes the letter case still rewrites the displayed text.
+    expect(renameLessonGroup(db, 1, "sad-262 a", "Sad-262 A")).toBe(2);
+    expect(names(1, "teacher")).toEqual(["Sad-262 A", "Sad-262 A", "IBM-261"]);
+    // Nothing to rename: the same name again, an unknown group, an empty old or new name.
+    expect(renameLessonGroup(db, 1, "Sad-262 A", " Sad-262 A ")).toBe(0);
+    expect(renameLessonGroup(db, 1, "X-1", "X-2")).toBe(0);
+    expect(renameLessonGroup(db, 1, "  ", "Y-1")).toBe(0);
+    expect(renameLessonGroup(db, 1, "IBM-261", "  ")).toBe(0);
+    expect(names(1, "teacher")).toEqual(["Sad-262 A", "Sad-262 A", "IBM-261"]);
   });
 });
 

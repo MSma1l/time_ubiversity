@@ -12,6 +12,10 @@ Mini App mobilă (deschisă din Telegram) pentru organizarea orelor universitare
   separat (orele unui rol dezactivat nu mai generează memento-uri).
 - **Memento-uri Telegram** — pentru fiecare oră se alege cu câte minute înainte (0–180) trimite
   botul mesajul; memento-urile apar și în lista de notificări din Mini App.
+- **Calendar academic** — semestrele se configurează din variabila `SEMESTERS`, iar paritatea
+  repornește la fiecare semestru. Sărbătorile legale ale Moldovei (inclusiv cele mobile, legate de
+  Paștele ortodox) sunt cunoscute automat; în zilele libere și în afara semestrelor orele rămân
+  vizibile, dar botul tace.
 - **Catalog Profesor** (PostgreSQL) — grupe, studenți, prezență pe zile
   (prezent / absent / întârziat) și note la laboratoare (0–10).
 - **Comenzi bot** (doar în chat privat): `/start`, `/help`, `/azi`, `/saptamana`,
@@ -35,7 +39,8 @@ deploy/                  deploy.sh, backup.sh, Caddyfile
 docker-compose.yml       stiva de producție
 docker-compose.dev.yml   override local: expune PostgreSQL și API-ul pe localhost
 .env.example             variabile Compose (POSTGRES_*, WEB_PORT, WEB_BIND)
-backend/.env.example     variabile aplicație (token bot, URL-uri, securitate)
+backend/.env.example     variabile aplicație (token bot, URL-uri, securitate, SEMESTERS)
+frontend/.env.example    variabile Vite (VITE_API_URL, VITE_DEV_TELEGRAM_ID, VITE_DEMO_MODE)
 ```
 
 Detalii despre componente, fluxul datelor și schema bazelor de date:
@@ -77,6 +82,9 @@ Modurile Mini App-ului în afara Telegram:
 
 `VITE_DEV_TELEGRAM_ID` este ignorat în build-ul de producție. Un build de producție deschis în
 afara Telegram cere deschiderea aplicației din bot (excepție: build cu `VITE_DEMO_MODE=true`).
+Cele trei variabile `VITE_*` sunt explicate în [`frontend/.env.example`](frontend/.env.example)
+(`cp frontend/.env.example frontend/.env.local`); sunt încorporate în bundle la build, deci nu
+pune niciodată secrete acolo.
 
 ## Pornire cu Docker (local)
 
@@ -94,8 +102,8 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 Observații:
 
-- Compose forțează `NODE_ENV=production`, `PORT`, `DATABASE_PATH=/data/orar.sqlite` și
-  construiește `DATABASE_URL` din `POSTGRES_*` din `.env`-ul din rădăcină. În producție
+- Compose forțează `NODE_ENV=production`, `PORT`, `HOST=0.0.0.0`, `DATABASE_PATH=/data/orar.sqlite`
+  și construiește `DATABASE_URL` din `POSTGRES_*` din `.env`-ul din rădăcină. În producție
   `TELEGRAM_BOT_TOKEN` este obligatoriu, iar `ALLOW_DEV_AUTH=true` este refuzat.
 - Parola PostgreSQL se aplică doar la prima creare a volumului (vezi comentariile din `.env.example`).
 - Fără `docker-compose.dev.yml` doar serviciul `web` publică un port.
@@ -109,7 +117,7 @@ Observații:
 | `npm run dev --prefix backend` | API în mod watch (`tsx watch src/index.ts`) |
 | `npm run build --prefix backend` | compilare TypeScript în `backend/dist` |
 | `npm start --prefix backend` | rulează `dist/index.js` |
-| `npm test --prefix backend` | teste Vitest (45 de teste; nu necesită PostgreSQL) |
+| `npm test --prefix backend` | suita Vitest (config, validare, API, bot, memento-uri, catalog); rulează fără PostgreSQL — testele de catalog sunt sărite dacă lipsește `DATABASE_URL_TEST` |
 | `npm run dev --prefix frontend` | server Vite pe portul 5173 |
 | `npm run build --prefix frontend` | `tsc -b` + `vite build` în `frontend/dist` |
 | `npm run lint --prefix frontend` | ESLint, fără avertismente permise |
@@ -120,7 +128,8 @@ Observații:
 
 1. VPS cu Docker Compose v2; domeniu cu DNS către VPS, porturile 80/443 deschise.
 2. `cp .env.example .env` și `cp backend/.env.example backend/.env`, apoi completează:
-   `POSTGRES_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `MINI_APP_URL` (HTTPS), `ALLOWED_ORIGINS`.
+   `POSTGRES_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `MINI_APP_URL` (HTTPS), `ALLOWED_ORIGINS` și
+   `SEMESTERS` (calendarul academic — vezi mai jos; lăsat gol, se folosește semestrul implicit).
 3. Alege **un singur** mod pentru bot: `TELEGRAM_POLLING=true` sau webhook
    (`TELEGRAM_POLLING=false`, `WEBHOOK_URL`, `TELEGRAM_WEBHOOK_SECRET`). Nu porni două instanțe cu același token.
 4. `./deploy/deploy.sh` — validează configurația, construiește, pornește și așteaptă health-check-urile.
@@ -130,12 +139,33 @@ Observații:
 
 Ghidul complet (instalare, actualizare, restaurare backup, depanare): [docs/DEPLOY.md](docs/DEPLOY.md).
 
-## Săptămâni pare / impare
+## Semestre și săptămâni pare / impare
 
-Referința este **7–13 septembrie 2026 = săptămână pară** (săptămâna universitară nr. 1), în
-fusul orar `Europe/Chisinau`, cu săptămâni care încep lunea. De acolo paritatea alternează:
-14–20 septembrie 2026 este impară, 21–27 septembrie pară etc. Endpointul `GET /api/week`
-întoarce numărul și tipul săptămânii pentru o dată.
+Calendarul academic se configurează din variabila de mediu **`SEMESTERS`**, în formatul
+`START:even|odd[:END]`, intrările separate prin virgulă:
+
+```ini
+SEMESTERS=2026-09-07:even:2026-12-20,2027-02-01:even:2027-05-30
+```
+
+- `START` trebuie să fie o **luni** — prima luni a semestrului — și dă paritatea primei săptămâni.
+- `END` este inclusiv și poate lipsi doar la ultima intrare; semestrele nu se pot suprapune.
+- **Paritatea și numerotarea repornesc la fiecare semestru**, așa că vacanța de iarnă nu mai
+  consumă paritate și nu mai poate inversa semestrul II.
+- O valoare greșită oprește API-ul la pornire, cu lista completă a problemelor.
+- Lăsată **goală**, se păstrează exact comportamentul anterior: un singur semestru fără sfârșit,
+  început la `2026-09-07`, săptămână pară. Toate calculele sunt în fusul `Europe/Chisinau`, cu
+  săptămâni care încep lunea.
+
+`GET /api/week` este singura sursă de adevăr: întoarce numărul și paritatea săptămânii, semestrul
+din care face parte data, lista semestrelor configurate și zilele nelucrătoare ale săptămânii
+afișate. Detalii: [docs/ARHITECTURA.md](docs/ARHITECTURA.md), secțiunea 5.
+
+**Zile fără ore.** Sărbătorile legale ale Republicii Moldova sunt adăugate automat pentru anul curent
+și pentru următorul (cele cu dată fixă și cele mobile, derivate din Paștele ortodox calculat), la care
+se adaugă zilele marcate manual pe server. Perioadele din afara semestrelor sunt nelucrătoare prin
+construcție, fără să fie nevoie să enumere cineva vacanța de vară. În toate aceste zile **orele rămân
+vizibile în orar — se opresc doar memento-urile.**
 
 Orarul UTM în PDF este o foaie vizuală cu celule unite, de aceea orele se introduc și se
 editează manual în Mini App, în locul unei extrageri automate fragile.
@@ -143,8 +173,10 @@ editează manual în Mini App, în locul unei extrageri automate fragile.
 ## Securitate pe scurt
 
 - Fiecare cerere `/api` trimite `Telegram.WebApp.initData` în headerul `X-Telegram-Init-Data`;
-  serverul verifică semnătura HMAC cu tokenul botului și vârsta datelor (`INIT_DATA_MAX_AGE_SECONDS`).
-- Toate datele sunt filtrate după utilizatorul autentificat; Catalogul Profesor verifică proprietarul grupei.
+  serverul verifică semnătura HMAC cu tokenul botului și vârsta datelor (`INIT_DATA_MAX_AGE_SECONDS`,
+  implicit **1 oră**: `initData` e o credențială de tip bearer, fără revocare, deci fereastra stă scurtă).
+- Toate datele sunt filtrate după utilizatorul autentificat; Catalogul Profesor cere modul Profesor
+  activ (altfel 403) și verifică proprietarul grupei.
 - `X-Dev-Telegram-Id` funcționează doar cu `ALLOW_DEV_AUTH=true`, refuzat când `NODE_ENV=production`.
 - Tokenul botului **nu ajunge niciodată în frontend sau în Git**; `.env` și `backend/.env` sunt în `.gitignore`.
 - Webhook-ul Telegram este acceptat doar cu `X-Telegram-Bot-Api-Secret-Token` corect.

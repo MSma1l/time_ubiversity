@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { afterEach, vi } from "vitest";
-import { BOT_COMMANDS, botReply, pollingBackoff, registerBotCommands } from "./bot.js";
+import { asUpdateList, BOT_COMMAND_LIMIT, BOT_COMMANDS, botReply, handleBotMessage, pollingBackoff, registerBotCommands } from "./bot.js";
 import { loadConfig } from "./config.js";
 import { openDatabase } from "./db.js";
 import { TelegramApiError } from "./telegram.js";
@@ -78,6 +78,15 @@ describe("botReply usage and profile rules", () => {
     expect(botReply(db, message("/nimic"), NOW)?.text).toContain("Nu cunosc");
   });
 
+  it("treats prototype keys as an invalid /rol argument instead of crashing", () => {
+    const db = openDatabase(":memory:");
+    for (const text of ["/rol __proto__", "/rol constructor", "/rol toString", "/rol hasOwnProperty"]) {
+      const answer = botReply(db, message(text), NOW)?.text ?? "";
+      expect(answer).toContain("/rol student");
+    }
+    expect(db.prepare("SELECT role FROM profiles WHERE telegram_id=42").get()).toEqual({ role: "student" });
+  });
+
   it("refuses /rol for a disabled mode and keeps the active role", () => {
     const db = openDatabase(":memory:");
     botReply(db, message("/start"), NOW);
@@ -104,6 +113,47 @@ describe("registerBotCommands", () => {
     expect(JSON.parse(String(init.body)).commands).toEqual(BOT_COMMANDS);
     fetchMock.mockImplementationOnce(async () => new Response(JSON.stringify({ ok: false, description: "bad" }), { status: 400 }));
     expect(await registerBotCommands(config, undefined, silent)).toBe(false);
+  });
+});
+
+describe("handleBotMessage", () => {
+  const TOKEN = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw1";
+  const ok = () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+  const fail = (status: number, parameters?: { retry_after: number }) => new Response(JSON.stringify({ ok: false, description: "nope", parameters }), { status });
+  const flood = (id: number) => ({ text: "/status", chat: { id, type: "private" }, from: { id, first_name: "Ion" } });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("drops a sender's messages in silence past the per-minute limit", async () => {
+    const fetchMock = vi.fn(async () => ok());
+    vi.stubGlobal("fetch", fetchMock);
+    const db = openDatabase(":memory:");
+    const config = loadConfig({ TELEGRAM_BOT_TOKEN: TOKEN });
+    for (let i = 0; i < BOT_COMMAND_LIMIT + 5; i += 1) await handleBotMessage(db, config, flood(4242));
+    expect(fetchMock).toHaveBeenCalledTimes(BOT_COMMAND_LIMIT);
+    // The limit is per sender: another user is unaffected.
+    await handleBotMessage(db, config, flood(4343));
+    expect(fetchMock).toHaveBeenCalledTimes(BOT_COMMAND_LIMIT + 1);
+  });
+
+  it("retries a reply once on 429/5xx but not on a client error", async () => {
+    const db = openDatabase(":memory:");
+    const config = loadConfig({ TELEGRAM_BOT_TOKEN: TOKEN });
+    const transient = vi.fn(async () => (transient.mock.calls.length === 1 ? fail(500) : ok()));
+    vi.stubGlobal("fetch", transient);
+    await handleBotMessage(db, config, flood(5151));
+    expect(transient).toHaveBeenCalledTimes(2);
+    const forbidden = vi.fn(async () => fail(403));
+    vi.stubGlobal("fetch", forbidden);
+    await expect(handleBotMessage(db, config, flood(5252))).rejects.toThrow(/403/);
+    expect(forbidden).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("asUpdateList", () => {
+  it("passes arrays through and names the payload when getUpdates returns anything else", () => {
+    expect(asUpdateList([])).toEqual([]);
+    expect(asUpdateList([{ update_id: 1 }])).toEqual([{ update_id: 1 }]);
+    for (const value of [undefined, null, true, { ok: true }]) expect(() => asUpdateList(value)).toThrow(/getUpdates/);
   });
 });
 

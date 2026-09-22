@@ -1,18 +1,18 @@
 import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import helmet from "helmet";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { ZodError } from "zod";
 import { academicDatabase, academicHealth, ensureAcademicSchema, isConnectionError, resetAcademicSchema } from "./academic.js";
 import { handleBotMessage, webhookSecret } from "./bot.js";
 import type { AppConfig } from "./config.js";
-import { addNotification, lessonById, lessonRows, upsertProfile, type Lesson, type SqliteDatabase } from "./db.js";
-import { backfillOwnerGroups, ownerLessonLinks, syncLessonGroup, withLessonLinks } from "./groupSync.js";
-import { ProfileRuleError, readProfile, updateProfile } from "./profile.js";
+import { addNotification, lessonById, lessonRows, nonWorkingDaysBetween, upsertProfile, type Lesson, type SqliteDatabase } from "./db.js";
+import { backfillOwnerGroups, lockCatalogGroup, lockOwnerCatalog, ownerLessonLinks, renameLessonGroup, syncLessonGroup, withLessonLinks } from "./groupSync.js";
+import { ProfileRuleError, readProfile, updateProfile, type Profile } from "./profile.js";
 import { createRateLimiter, rateLimitMiddleware } from "./rateLimit.js";
-import { isoDateInChisinau, isValidIsoDate, SEMESTER_REFERENCE_KIND, SEMESTER_REFERENCE_MONDAY, universityWeekKind, universityWeekNumber } from "./schedule.js";
+import { addDays, isoDateInChisinau, isoWeekday, isValidIsoDate, SEMESTER_REFERENCE_KIND, SEMESTER_REFERENCE_MONDAY, weekInfo } from "./schedule.js";
 import { safeEqual, validateInitData, type TelegramUser } from "./telegram.js";
-import { attendanceQuerySchema, attendanceSchema, gradeSchema, groupPatchSchema, groupSchema, lessonIdSchema, lessonSchema, lessonUpdateSchema, notificationsReadSchema, profilePatchSchema, studentPatchSchema, studentSchema, uuidSchema } from "./validation.js";
+import { attendanceQuerySchema, attendanceSchema, gradeSchema, groupPatchSchema, groupSchema, lessonIdSchema, lessonSchema, lessonUpdateSchema, nonWorkingRangeSchema, notificationsReadSchema, profilePatchSchema, studentPatchSchema, studentSchema, uuidSchema } from "./validation.js";
 
 export const LIMITS = { lessonsPerUser: 500, groupsPerTeacher: 200, studentsPerGroup: 500 };
 
@@ -36,6 +36,13 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   app.set("trust proxy", config.trustProxy);
   app.use(helmet({ crossOriginResourcePolicy: false }));
 
+  const ipLimiter = createRateLimiter(config.rateLimitPerMinute * 5);
+  const userLimiter = createRateLimiter(config.rateLimitPerMinute);
+  // /health is public and is registered before the /api limiter, so it gets its own generous one:
+  // without it a flood of health checks exhausts the PostgreSQL pool used by the Teacher Catalog.
+  const healthLimiter = createRateLimiter(60);
+  setInterval(() => { ipLimiter.prune(); userLimiter.prune(); healthLimiter.prune(); }, 60_000).unref();
+
   const health = async (_req: Request, res: Response) => {
     let sqlite: "ok" | "error" = "ok";
     try { db.prepare("SELECT 1").get(); } catch { sqlite = "error"; }
@@ -46,12 +53,9 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     // Only SQLite (the schedule) is critical; PostgreSQL powers the optional Teacher Catalog.
     res.status(ok ? 200 : 503).json({ ok, status, sqlite, postgres });
   };
-  app.get("/health", health);
-  app.get("/api/health", health);
-
-  const ipLimiter = createRateLimiter(config.rateLimitPerMinute * 5);
-  const userLimiter = createRateLimiter(config.rateLimitPerMinute);
-  setInterval(() => { ipLimiter.prune(); userLimiter.prune(); }, 60_000).unref();
+  const healthLimit = rateLimitMiddleware(healthLimiter, (req) => `ip:${req.ip ?? "unknown"}`);
+  app.get("/health", healthLimit, health);
+  app.get("/api/health", healthLimit, health);
 
   const devHeaders = config.allowDevAuth ? ["X-Dev-Telegram-Id"] : [];
   app.use("/api", cors({
@@ -64,6 +68,8 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   app.use(express.json({ limit: "64kb" }));
 
   function auth(req: Request, res: Response, next: NextFunction) {
+    // Teacher Catalog routes run `auth` twice (mount + route); the second pass must not count again.
+    if ((req as Partial<AuthRequest>).telegramUser) return next();
     const initData = req.header("x-telegram-init-data") ?? "";
     let user = validateInitData(initData, config.token, config.initDataMaxAgeSeconds);
     if (!user && config.allowDevAuth && req.header("x-dev-telegram-id")) {
@@ -82,26 +88,67 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   }
 
   const profileOf = (id: number) => readProfile(db, id);
+  /**
+   * The profile as the API exposes it. The schedule is the university's, so there is no personal time zone:
+   * the fields are listed explicitly to keep an internal column from leaking into the answer.
+   */
+  const publicProfile = (profile: Profile | undefined) => profile && {
+    telegramId: profile.telegramId, displayName: profile.displayName, role: profile.role,
+    studentEnabled: profile.studentEnabled, teacherEnabled: profile.teacherEnabled, remindersEnabled: profile.remindersEnabled
+  };
 
   app.get("/api/me", auth, (req, res) => {
     const user = userOf(req);
-    res.json({ profile: profileOf(user.id), telegram: { id: user.id, firstName: user.first_name, username: user.username } });
+    res.json({ profile: publicProfile(profileOf(user.id)), telegram: { id: user.id, firstName: user.first_name, username: user.username } });
   });
   app.patch("/api/me", auth, (req, res) => {
     const body = profilePatchSchema.parse(req.body);
     // Mode rules (profile.ts) are checked on the merged profile inside one transaction.
     try {
-      res.json(updateProfile(db, userOf(req).id, body));
+      res.json(publicProfile(updateProfile(db, userOf(req).id, body)));
     } catch (error) {
       if (error instanceof ProfileRuleError) return res.status(409).json({ error: error.message });
       throw error;
     }
   });
+  /** Monday → Sunday of one date: the calendar marks the free days of the whole displayed week. */
+  const weekBounds = (isoDate: string) => {
+    const monday = addDays(isoDate, 1 - isoWeekday(isoDate));
+    return { monday, sunday: addDays(monday, 6) };
+  };
+  /**
+   * The single source of truth for week numbering: with several semesters the parity restarts at each
+   * of them, so no client can still derive it from one hardcoded anchor. `semesters` lets the interface
+   * mark the breaks, `nonWorkingDays` covers the displayed week (Monday→Sunday), not only the date asked.
+   */
   app.get("/api/week", auth, (req, res) => {
     const date = req.query.date;
     if (date !== undefined && !isValidIsoDate(date)) return res.status(400).json({ error: "Data trebuie să fie în format YYYY-MM-DD" });
     const requested = date ?? isoDateInChisinau();
-    res.json({ date: requested, number: universityWeekNumber(requested), kind: universityWeekKind(requested), referenceMonday: SEMESTER_REFERENCE_MONDAY, referenceKind: SEMESTER_REFERENCE_KIND });
+    const { monday, sunday } = weekBounds(requested);
+    res.json({
+      ...weekInfo(requested, config.semesters),
+      semesters: config.semesters,
+      nonWorkingDays: nonWorkingDaysBetween(db, monday, sunday),
+      // @deprecated referenceMonday / referenceKind: the old single global anchor, replaced by `semesters`.
+      // Kept one more version so clients released before the semesters still render a week; remove afterwards.
+      referenceMonday: SEMESTER_REFERENCE_MONDAY, referenceKind: SEMESTER_REFERENCE_KIND
+    });
+  });
+  /**
+   * Free days of a closed interval, for a calendar that paints more than one week at a time.
+   * Read-only on purpose. There is no administrator in this application — a profile only has
+   * `studentEnabled` / `teacherEnabled`, and every authenticated Telegram user gets both — while a
+   * non-working day is institution-wide: it hides lessons and silences the reminders of *everyone*.
+   * A write route reachable by any user would therefore be a one-request denial of service on the
+   * whole university's reminders, and no rule available here (role, mode, ownership) can tell an
+   * administrator apart. Until a real administrator model exists, adding and removing free days stays
+   * a server-side operation (`setNonWorkingDay` / `removeNonWorkingDay` in db.ts, run on the server —
+   * see docs), which is why no POST/DELETE is registered here.
+   */
+  app.get("/api/non-working-days", auth, (req, res) => {
+    const { from, to } = nonWorkingRangeSchema.parse({ from: req.query.from, to: req.query.to });
+    res.json(nonWorkingDaysBetween(db, from, to));
   });
 
   const roleLabel = (role: string) => role === "teacher" ? "Profesor" : "Student";
@@ -172,6 +219,11 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   });
 
   // ---- Teacher Catalog (PostgreSQL). Every query is scoped to the authenticated owner. ----
+  /** The catalog belongs to the Profesor mode: the rule is enforced here, not only in the interface. */
+  app.use("/api/teacher", auth, (req: Request, res: Response, next: NextFunction) => {
+    if (!profileOf(userOf(req).id)?.teacherEnabled) return res.status(403).json({ error: "Catalogul Profesor este disponibil doar cu modul Profesor activat. Activează-l în profil." });
+    next();
+  });
   async function catalog(res: Response): Promise<Pool | undefined> {
     const pg = academicDatabase(config.databaseUrl);
     if (!pg) {
@@ -187,6 +239,21 @@ export function createApp({ db, config, log = console }: AppDependencies) {
       return undefined;
     }
   }
+  /** Runs `work` in one PostgreSQL transaction; any error (including HttpError) rolls it back. */
+  async function inTransaction<T>(pg: Pool, work: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await pg.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await work(client);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
   const ownedGroup = async (pg: Pool, groupId: string, ownerId: number) => (await pg.query("SELECT id FROM academic_groups WHERE id=$1 AND owner_id=$2", [groupId, ownerId])).rowCount;
   /** Malformed ids cannot exist, so they are reported as not found instead of a database error. */
   const parseUuid = (value: unknown, notFound: string) => {
@@ -195,8 +262,8 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     return parsed.data;
   };
   /** Group names are unique per owner regardless of letter case (si-265 = SI-265). */
-  const assertGroupNameFree = async (pg: Pool, ownerId: number, name: string, exceptId?: string) => {
-    const clash = await pg.query("SELECT name FROM academic_groups WHERE owner_id=$1 AND lower(name)=lower($2) AND ($3::uuid IS NULL OR id<>$3::uuid) LIMIT 1", [ownerId, name, exceptId ?? null]);
+  const assertGroupNameFree = async (client: Pick<PoolClient, "query">, ownerId: number, name: string, exceptId?: string) => {
+    const clash = await client.query("SELECT name FROM academic_groups WHERE owner_id=$1 AND lower(name)=lower($2) AND ($3::uuid IS NULL OR id<>$3::uuid) LIMIT 1", [ownerId, name, exceptId ?? null]);
     if (clash.rowCount) throw new HttpError(409, groupExists(clash.rows[0].name));
   };
   const GROUP_COLUMNS = "g.id, g.owner_id, g.name, g.subject, g.created_at, (SELECT COUNT(*)::int FROM students s WHERE s.group_id=g.id) AS student_count";
@@ -204,8 +271,8 @@ export function createApp({ db, config, log = console }: AppDependencies) {
 
   /**
    * Groups linked to the Profesor schedule: `linkedLessons` / `subjects` come from the owner's teacher lessons
-   * whose group name matches (trimmed, case-insensitive). Links are computed, never stored: renaming a group
-   * does not change lessons and deleting a group does not delete lessons.
+   * whose group name matches (trimmed, case-insensitive). Links are computed, never stored: they follow the
+   * name, which is why a rename is propagated to the lessons (PATCH below). Deleting a group deletes no lesson.
    */
   app.get("/api/teacher/groups", auth, async (req, res) => {
     const ownerId = userOf(req).id;
@@ -225,23 +292,45 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   app.post("/api/teacher/groups", auth, async (req, res) => {
     const input = groupSchema.parse(req.body); const ownerId = userOf(req).id;
     const pg = await catalog(res); if (!pg) return;
-    const count = (await pg.query("SELECT COUNT(*)::int AS count FROM academic_groups WHERE owner_id=$1", [ownerId])).rows[0].count as number;
-    if (count >= LIMITS.groupsPerTeacher) throw new HttpError(409, `Ai atins limita de ${LIMITS.groupsPerTeacher} grupe.`);
-    await assertGroupNameFree(pg, ownerId, input.name);
-    const result = await pg.query("INSERT INTO academic_groups(owner_id,name,subject) VALUES($1,$2,$3) RETURNING id, owner_id, name, subject, created_at, 0 AS student_count", [ownerId, input.name, input.subject]);
-    res.status(201).json(withLessonLinks(result.rows[0], ownerLessonLinks(db, ownerId)));
+    const created = await inTransaction(pg, async (client) => {
+      // COUNT and INSERT are separated by awaits: without the lock two parallel requests of the same
+      // teacher at `limit - 1` groups would both pass the check and exceed the limit.
+      await lockOwnerCatalog(client, ownerId);
+      const count = (await client.query("SELECT COUNT(*)::int AS count FROM academic_groups WHERE owner_id=$1", [ownerId])).rows[0].count as number;
+      if (count >= LIMITS.groupsPerTeacher) throw new HttpError(409, `Ai atins limita de ${LIMITS.groupsPerTeacher} grupe.`);
+      await assertGroupNameFree(client, ownerId, input.name);
+      return (await client.query("INSERT INTO academic_groups(owner_id,name,subject) VALUES($1,$2,$3) RETURNING id, owner_id, name, subject, created_at, 0 AS student_count",
+        [ownerId, input.name, input.subject])).rows[0];
+    });
+    res.status(201).json(withLessonLinks(created, ownerLessonLinks(db, ownerId)));
   });
-  /** Renaming only changes the catalog; lessons keep their group name (the link follows the name). */
+  /**
+   * Renaming the group renames it in the owner's Profesor lessons too (same `groupKey` matching, Student
+   * schedule untouched): the link follows the name, so a rename left only in the catalog would unlink the
+   * lessons and the next lesson save would recreate the old name as a second, empty group. A rename that
+   * changes only the letter case still rewrites the text shown in the schedule.
+   * Write order: SQLite is renamed inside the PostgreSQL transaction, just before COMMIT. A SQLite failure
+   * rolls the catalog back (nothing changes anywhere); if only the COMMIT fails, the schedule is renamed
+   * and the catalog is not, which repeating the very same request repairs (the reverse order could not be
+   * repaired: the old name would be gone from the catalog and no request could still find the lessons).
+   */
   app.patch("/api/teacher/groups/:groupId", auth, async (req, res) => {
     const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND); const input = groupPatchSchema.parse(req.body); const ownerId = userOf(req).id;
     const pg = await catalog(res); if (!pg) return;
-    if (!await ownedGroup(pg, groupId, ownerId)) return res.status(404).json({ error: GROUP_NOT_FOUND });
-    if (input.name !== undefined) await assertGroupNameFree(pg, ownerId, input.name, groupId);
-    await pg.query("UPDATE academic_groups SET name=COALESCE($3, name), subject=CASE WHEN $4 THEN $5 ELSE subject END WHERE id=$1 AND owner_id=$2",
-      [groupId, ownerId, input.name ?? null, input.subject !== undefined, input.subject ?? null]);
-    const result = await pg.query(`SELECT ${GROUP_COLUMNS} FROM academic_groups g WHERE g.id=$1 AND g.owner_id=$2`, [groupId, ownerId]);
-    if (!result.rowCount) return res.status(404).json({ error: GROUP_NOT_FOUND });
-    res.json(withLessonLinks(result.rows[0], ownerLessonLinks(db, ownerId)));
+    const group = await inTransaction(pg, async (client) => {
+      // The same lock as the lesson → catalog sync: a rename cannot race the creation of the old name.
+      await lockOwnerCatalog(client, ownerId);
+      const current = await client.query("SELECT name FROM academic_groups WHERE id=$1 AND owner_id=$2", [groupId, ownerId]);
+      if (!current.rowCount) throw new HttpError(404, GROUP_NOT_FOUND);
+      if (input.name !== undefined) await assertGroupNameFree(client, ownerId, input.name, groupId);
+      await client.query("UPDATE academic_groups SET name=COALESCE($3, name), subject=CASE WHEN $4 THEN $5 ELSE subject END WHERE id=$1 AND owner_id=$2",
+        [groupId, ownerId, input.name ?? null, input.subject !== undefined, input.subject ?? null]);
+      const result = await client.query(`SELECT ${GROUP_COLUMNS} FROM academic_groups g WHERE g.id=$1 AND g.owner_id=$2`, [groupId, ownerId]);
+      if (!result.rowCount) throw new HttpError(404, GROUP_NOT_FOUND);
+      if (input.name !== undefined) renameLessonGroup(db, ownerId, current.rows[0].name as string, input.name);
+      return result.rows[0];
+    });
+    res.json(withLessonLinks(group, ownerLessonLinks(db, ownerId)));
   });
   /** Deletes the group with its students, attendance and grades (ON DELETE CASCADE). Lessons are never deleted. */
   app.delete("/api/teacher/groups/:groupId", auth, async (req, res) => {
@@ -259,13 +348,17 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     res.json(result.rows);
   });
   app.post("/api/teacher/groups/:groupId/students", auth, async (req, res) => {
-    const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND); const input = studentSchema.parse(req.body);
+    const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND); const input = studentSchema.parse(req.body); const ownerId = userOf(req).id;
     const pg = await catalog(res); if (!pg) return;
-    if (!await ownedGroup(pg, groupId, userOf(req).id)) return res.status(404).json({ error: GROUP_NOT_FOUND });
-    const count = (await pg.query("SELECT COUNT(*)::int AS count FROM students WHERE group_id=$1", [groupId])).rows[0].count as number;
-    if (count >= LIMITS.studentsPerGroup) throw new HttpError(409, `Grupa a atins limita de ${LIMITS.studentsPerGroup} studenți.`);
-    const result = await pg.query("INSERT INTO students(group_id,first_name,last_name) VALUES($1,$2,$3) RETURNING *", [groupId, input.firstName, input.lastName]);
-    res.status(201).json(result.rows[0]);
+    const created = await inTransaction(pg, async (client) => {
+      // Same reason as for groups: COUNT and INSERT must not interleave with a parallel request.
+      await lockCatalogGroup(client, groupId);
+      if (!(await client.query("SELECT id FROM academic_groups WHERE id=$1 AND owner_id=$2", [groupId, ownerId])).rowCount) throw new HttpError(404, GROUP_NOT_FOUND);
+      const count = (await client.query("SELECT COUNT(*)::int AS count FROM students WHERE group_id=$1", [groupId])).rows[0].count as number;
+      if (count >= LIMITS.studentsPerGroup) throw new HttpError(409, `Grupa a atins limita de ${LIMITS.studentsPerGroup} studenți.`);
+      return (await client.query("INSERT INTO students(group_id,first_name,last_name) VALUES($1,$2,$3) RETURNING *", [groupId, input.firstName, input.lastName])).rows[0];
+    });
+    res.status(201).json(created);
   });
   const OWNED_STUDENT = "SELECT s.id FROM students s JOIN academic_groups g ON g.id=s.group_id WHERE s.id=$1 AND g.owner_id=$2";
   app.patch("/api/teacher/students/:studentId", auth, async (req, res) => {
@@ -305,7 +398,9 @@ export function createApp({ db, config, log = console }: AppDependencies) {
       await client.query("BEGIN");
       const group = await client.query("SELECT id FROM academic_groups WHERE id=$1 AND owner_id=$2", [groupId, userOf(req).id]);
       if (!group.rowCount) throw new HttpError(404, GROUP_NOT_FOUND);
-      const session = await client.query("INSERT INTO attendance_sessions(group_id,occurred_on,topic) VALUES($1,$2,$3) ON CONFLICT(group_id,occurred_on) DO UPDATE SET topic=COALESCE(EXCLUDED.topic, attendance_sessions.topic) RETURNING id", [groupId, input.date, input.topic]);
+      // A missing `topic` keeps the saved one; an empty one (null after validation) clears it.
+      const session = await client.query("INSERT INTO attendance_sessions(group_id,occurred_on,topic) VALUES($1,$2,$3) ON CONFLICT(group_id,occurred_on) DO UPDATE SET topic=CASE WHEN $4 THEN EXCLUDED.topic ELSE attendance_sessions.topic END RETURNING id",
+        [groupId, input.date, input.topic ?? null, input.topic !== undefined]);
       if (entries.length) {
         // Only students of this group can be marked; anything else aborts the whole request.
         const saved = await client.query(`INSERT INTO attendance_entries(session_id,student_id,status)
@@ -344,17 +439,14 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   });
 
   // ---- Telegram webhook (only active in webhook mode, authenticated by the secret token) ----
-  app.post("/telegram/webhook", async (req, res) => {
+  app.post("/telegram/webhook", (req, res) => {
     if (!config.token || config.polling) return res.status(404).json({ error: "Not found" });
     const supplied = req.header("x-telegram-bot-api-secret-token") ?? "";
     if (!safeEqual(supplied, webhookSecret(config))) return res.status(401).json({ error: "Unauthorized" });
-    try {
-      await handleBotMessage(db, config, req.body?.message);
-    } catch (error) {
-      // Always acknowledge: a non-2xx answer makes Telegram redeliver the same update repeatedly.
-      log.error("Telegram webhook handling failed:", error instanceof Error ? error.message : error);
-    }
+    // Acknowledge first, handle after: a slow answer (or a non-2xx one) makes Telegram redeliver the same update.
+    const message = req.body?.message;
     res.sendStatus(200);
+    void handleBotMessage(db, config, message).catch((error) => log.error("Telegram webhook handling failed:", error instanceof Error ? error.message : error));
   });
 
   app.use((_req: Request, res: Response) => res.status(404).json({ error: "Resursa nu a fost găsită" }));
@@ -363,10 +455,12 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     if (res.headersSent) return next(error);
     if (error instanceof ZodError) return res.status(400).json({ error: "Date invalide", fields: error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })) });
     if (error instanceof HttpError) return res.status(error.status).json({ error: error.message });
+    if (error instanceof ProfileRuleError) return res.status(error.status).json({ error: error.message });
     const details = (error ?? {}) as { type?: string, status?: number, code?: string, constraint?: string };
     if (details.type === "entity.parse.failed") return res.status(400).json({ error: "Corpul cererii nu este JSON valid" });
     if (details.type === "entity.too.large") return res.status(413).json({ error: "Cererea este prea mare" });
-    if (typeof details.status === "number" && details.status >= 400 && details.status < 500) return res.status(details.status).json({ error: "Cerere invalidă" });
+    // Only body-parser errors (they always carry a `type`); other errors with a `status` are ours and keep their meaning.
+    if (typeof details.type === "string" && typeof details.status === "number" && details.status >= 400 && details.status < 500) return res.status(details.status).json({ error: "Cerere invalidă" });
     // PostgreSQL constraint errors caused by user input.
     if (isConnectionError(error)) {
       // PostgreSQL went away after startup: re-check the schema once it is reachable again.

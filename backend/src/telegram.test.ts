@@ -45,6 +45,27 @@ describe("validateInitData", () => {
     expect(validateInitData(sign({ ...base, user: JSON.stringify({ id: "1", first_name: "X" }) }), TOKEN, 86_400, NOW)).toBeNull();
     expect(validateInitData(sign({ ...base, user: "not json" }), TOKEN, 86_400, NOW)).toBeNull();
   });
+  it("defaults to a one-hour replay window", () => {
+    expect(validateInitData(sign({ ...base, auth_date: String(NOW / 1000 - 1_800) }), TOKEN, undefined, NOW)).not.toBeNull();
+    expect(validateInitData(sign({ ...base, auth_date: String(NOW / 1000 - 7_200) }), TOKEN, undefined, NOW)).toBeNull();
+  });
+  it("rejects initData with duplicate keys even when the hash covers them all", () => {
+    const evil = JSON.stringify({ id: 1, first_name: "Evil" });
+    const fields: [string, string][] = [["auth_date", base.auth_date], ["user", evil], ["user", user]];
+    const checkString = [...fields].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, value]) => `${key}=${value}`).join("\n");
+    const secret = createHmac("sha256", "WebAppData").update(TOKEN).digest();
+    const params = new URLSearchParams(fields);
+    params.append("hash", createHmac("sha256", secret).update(checkString).digest("hex"));
+    expect(validateInitData(params.toString(), TOKEN, 3_600, NOW)).toBeNull();
+    // Control: the very same signing scheme without the duplicate is accepted.
+    const single = new URLSearchParams([["auth_date", base.auth_date], ["user", user]] as [string, string][]);
+    single.append("hash", createHmac("sha256", secret).update(`auth_date=${base.auth_date}\nuser=${user}`).digest("hex"));
+    expect(validateInitData(single.toString(), TOKEN, 3_600, NOW)).not.toBeNull();
+  });
+  it("returns only the whitelisted user fields, with the right types", () => {
+    const messy = JSON.stringify({ id: 5, first_name: "Ana", last_name: 7, username: "ana", is_premium: true, photo_url: "x" });
+    expect(validateInitData(sign({ ...base, user: messy }), TOKEN, 3_600, NOW)).toEqual({ id: 5, first_name: "Ana", username: "ana" });
+  });
 });
 
 describe("webhook secret", () => {
@@ -55,5 +76,8 @@ describe("webhook secret", () => {
     expect(safeEqual(secret, secret)).toBe(true);
     expect(safeEqual(secret, secret.slice(1))).toBe(false);
     expect(safeEqual("", secret)).toBe(false);
+  });
+  it("refuses to derive a secret from an empty token", () => {
+    expect(() => deriveWebhookSecret("")).toThrow(/bot token/);
   });
 });

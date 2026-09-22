@@ -9,18 +9,20 @@ type Props = {
   lesson: Lesson
   role: Role
   timing?: LessonTiming
+  /** The day is non-working or outside every semester: the lesson keeps the visual treatment of a past one. */
+  muted?: boolean
   onEdit(): void
   /** Teacher schedule: opens the catalog on the lesson's group. */
   onOpenGroup?(group: string): void
 }
 
-export function LessonCard({ lesson, role, timing, onEdit, onOpenGroup }: Props) {
+export function LessonCard({ lesson, role, timing, muted = false, onEdit, onOpenGroup }: Props) {
   const groupAction = role === 'teacher' && lesson.group && onOpenGroup
   const who = role === 'teacher' ? (groupAction ? '' : lesson.group) : lesson.teacher || lesson.group
   const state = timing?.state ?? 'upcoming'
   const text = timingText(timing)
   const summary = `${lesson.title}, ${lesson.startTime}–${lesson.endTime}${text ? `, ${text.spoken}` : ''}`
-  return <article className={`lesson ${tones[lesson.weekType]} ${state}`} aria-label={summary}>
+  return <article className={`lesson ${tones[lesson.weekType]} ${muted ? 'past' : state}`} aria-label={summary}>
     <time>{lesson.startTime}<small>{lesson.endTime}</small></time>
     <div className="lesson-info">
       <div className="lesson-meta">

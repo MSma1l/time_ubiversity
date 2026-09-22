@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import {
-  createTeacherGroup, createTeacherStudent, deleteTeacherGroup, deleteTeacherStudent, errorMessage, loadAttendance, loadLabGrades, loadTeacherGroups, loadTeacherStudents,
+  createTeacherGroup, createTeacherStudent, deleteTeacherGroup, deleteTeacherStudent, errorMessage, isSessionExpired, loadAttendance, loadLabGrades, loadTeacherGroups, loadTeacherStudents,
   renameTeacherGroup, renameTeacherStudent, saveAttendance, saveLabGrade, type AttendanceStatus, type LabGrade, type TeacherGroup, type TeacherStudent,
 } from '../api'
 import { useDialog } from '../dialogs'
@@ -46,14 +46,19 @@ type Props = {
   mode: 'settings' | 'records', available: boolean, onClose(): void
   /** Opens on this group (matched case-insensitively), e.g. from a lesson card; groups created from lessons may need one re-fetch. */
   initialGroupName?: string
+  /** A write answered 401/403: the app marks the whole session as expired. */
+  onSessionExpired?(error: unknown): void
+  /** The backend renamed the group in the Profesor lessons too; the app mirrors it. Returns how many lessons changed. */
+  onGroupRenamed?(previousName: string, nextName: string): number
 }
 type GradesState = { studentId: string, items: LabGrade[], loading: boolean, failed: boolean }
 type StudentDraft = { id: string, firstName: string, lastName: string }
 
-export function TeacherCatalog({ mode, available, onClose, initialGroupName }: Props) {
+export function TeacherCatalog({ mode, available, onClose, initialGroupName, onSessionExpired, onGroupRenamed }: Props) {
   const dialogRef = useDialog<HTMLElement>(onClose)
   const isSettings = mode === 'settings'
-  const [today] = useState(() => universityClock().isoDate)
+  /** Day the catalog writes to; re-read before every write, because the panel can stay open past midnight. */
+  const [today, setToday] = useState(() => universityClock().isoDate)
   const [groups, setGroups] = useState<TeacherGroup[]>([])
   const [groupsLoading, setGroupsLoading] = useState(available)
   const [groupsReload, setGroupsReload] = useState(0)
@@ -80,6 +85,11 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName }: P
   /** Group still to be selected after the groups load, and whether the list was already re-fetched for it. */
   const pendingGroupRef = useRef(initialGroupName?.trim() ?? '')
   const pendingRetriedRef = useRef(false)
+  /** Synchronous twin of `busy`: `busy` is only readable at the next render, too late for two quick taps. */
+  const busyRef = useRef(false)
+  /** A load failed and left its message on screen; only that same load clears it again. */
+  const studentsFailedRef = useRef(false)
+  const attendanceFailedRef = useRef(false)
 
   useEffect(() => {
     if (!available) return
@@ -121,10 +131,16 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName }: P
     if (!available || !selected) return
     let active = true
     loadTeacherStudents(selected)
-      .then((items) => { if (active) setStudentsState({ groupId: selected, items: sortStudents(items), failed: false }) })
+      .then((items) => {
+        if (!active) return
+        setStudentsState({ groupId: selected, items: sortStudents(items), failed: false })
+        // The error of another group must not stay on screen over a list that loaded fine.
+        if (studentsFailedRef.current) { studentsFailedRef.current = false; setMessage('') }
+      })
       .catch((error) => {
         if (!active) return
         setStudentsState({ groupId: selected, items: [], failed: true })
+        studentsFailedRef.current = true
         setMessage(errorMessage(error, 'Nu s-au putut încărca studenții.'))
       })
     return () => { active = false }
@@ -135,10 +151,15 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName }: P
     if (!available || isSettings || tab !== 'attendance' || !selected) return
     let active = true
     loadAttendance(selected, today)
-      .then((saved) => { if (active) setAttendance({ groupId: selected, marks: Object.fromEntries(saved.entries.map((entry) => [entry.studentId, entry.status])), failed: false }) })
+      .then((saved) => {
+        if (!active) return
+        setAttendance({ groupId: selected, marks: Object.fromEntries(saved.entries.map((entry) => [entry.studentId, entry.status])), failed: false })
+        if (attendanceFailedRef.current) { attendanceFailedRef.current = false; setMessage('') }
+      })
       .catch((error) => {
         if (!active) return
         setAttendance({ groupId: selected, marks: {}, failed: true })
+        attendanceFailedRef.current = true
         setMessage(errorMessage(error, 'Prezența salvată nu a putut fi încărcată.'))
       })
     return () => { active = false }
@@ -152,12 +173,41 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName }: P
   const reloadGroups = () => { setGroupsLoading(true); setMessage(''); setGroupsReload((value) => value + 1) }
   const reloadStudents = () => { setStudentsState({ groupId: '', items: [], failed: false }); setMessage(''); setStudentsReload((value) => value + 1) }
   const reloadAttendance = () => { setAttendance({ groupId: '', marks: {}, failed: false }); setMessage(''); setAttendanceReload((value) => value + 1) }
-  const selectGroup = (groupId: string) => { setSelected(groupId); setGrades(null); setStudentDraft(null); setGroupDraft(null) }
+  /** Everything tied to the previous group is dropped, so a half-filled student form can never be submitted into another group. */
+  const selectGroup = (groupId: string) => {
+    setSelected(groupId); setGrades(null); setStudentDraft(null); setGroupDraft(null)
+    setShowStudentForm(false); setFirstName(''); setLastName('')
+    studentsFailedRef.current = false; attendanceFailedRef.current = false
+    setMessage('')
+  }
 
-  const run = async (action: () => Promise<void>, fallback: string) => {
-    if (busy) return
+  /**
+   * One write at a time. The guard is a ref because `busy` comes from the render that is already on screen,
+   * and `confirm` runs inside the guard: two quick taps on Delete would otherwise open two confirmations.
+   */
+  const run = async (action: () => Promise<void>, fallback: string, confirm?: string) => {
+    if (busyRef.current) return
+    busyRef.current = true
     setBusy(true)
-    try { await action() } catch (error) { setMessage(errorMessage(error, fallback)) } finally { setBusy(false) }
+    try {
+      if (confirm && !await confirmAction(confirm)) return
+      await action()
+    } catch (error) {
+      setMessage(errorMessage(error, fallback))
+      if (isSessionExpired(error)) onSessionExpired?.(error)
+    } finally {
+      busyRef.current = false
+      setBusy(false)
+    }
+  }
+
+  /** Past midnight the displayed day is stale: refresh it (the attendance reloads) and let the caller warn. */
+  const rolledOverDate = () => {
+    const current = universityClock().isoDate
+    if (current === today) return null
+    setToday(current)
+    setAttendance({ groupId: '', marks: {}, failed: false })
+    return current
   }
 
   const addGroup = (event: FormEvent) => {
@@ -165,7 +215,7 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName }: P
     if (groupName.trim().length < 2) return setMessage('Numele grupei trebuie să aibă cel puțin 2 caractere.')
     void run(async () => {
       const group = await createTeacherGroup(groupName, subject)
-      setGroups((items) => sortGroups([...items, { ...group, student_count: group.student_count ?? 0 }]))
+      setGroups((items) => sortGroups([...items, group]))
       selectGroup(group.id); setGroupName(''); setSubject(''); setShowGroupForm(false)
       setMessage(`Grupa ${group.name} a fost salvată.`)
     }, 'Grupa nu a fost salvată.')
@@ -176,25 +226,27 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName }: P
     if (!selectedGroup || groupDraft === null) return
     if (groupDraft.trim().length < 2) return setMessage('Numele grupei trebuie să aibă cel puțin 2 caractere.')
     const groupId = selectedGroup.id
+    const previousName = selectedGroup.name
     void run(async () => {
       const group = await renameTeacherGroup(groupId, groupDraft)
       setGroups((items) => sortGroups(items.map((item) => item.id === groupId ? { ...item, ...group } : item)))
       setGroupDraft(null)
-      setMessage(`Grupa a fost redenumită în ${group.name}.`)
+      // The server also renamed the group in the Profesor lessons; without this the schedule would keep the old name until a reload.
+      const renamed = onGroupRenamed?.(previousName, group.name) ?? 0
+      setMessage(`Grupa a fost redenumită în ${group.name}.${renamed ? ` ${lessonsLabel(renamed)} din orar ${renamed === 1 ? 'a fost actualizată' : 'au fost actualizate'}.` : ''}`)
     }, 'Grupa nu a fost redenumită.')
   }
 
   const removeGroup = async () => {
-    if (!selectedGroup || busy) return
+    if (!selectedGroup) return
     const group = selectedGroup
     const count = group.student_count === 1 ? '1 student' : `${group.student_count} studenți`
-    if (!await confirmAction(`Ștergi grupa „${group.name}”? Se șterg definitiv ${count}, prezența și notele lor.`)) return
     await run(async () => {
       await deleteTeacherGroup(group.id)
       const rest = groups.filter((item) => item.id !== group.id)
       setGroups(rest); selectGroup(rest[0]?.id ?? '')
       setMessage(`Grupa ${group.name} a fost ștearsă.`)
-    }, 'Grupa nu a fost ștearsă.')
+    }, 'Grupa nu a fost ștearsă.', `Ștergi grupa „${group.name}”? Se șterg definitiv ${count}, prezența și notele lor.`)
   }
 
   const addStudent = (event: FormEvent) => {
@@ -225,18 +277,19 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName }: P
   }
 
   const removeStudent = async (student: TeacherStudent) => {
-    if (busy || !await confirmAction(`Ștergi studentul ${fullName(student)}? Se șterg definitiv și prezența și notele lui.`)) return
     const groupId = selected
     await run(async () => {
       await deleteTeacherStudent(student.id)
       setStudentsState((state) => ({ ...state, items: state.items.filter((item) => item.id !== student.id) }))
       setGroups((items) => items.map((item) => item.id === groupId ? { ...item, student_count: Math.max(item.student_count - 1, 0) } : item))
       setMessage(`Studentul ${fullName(student)} a fost șters.`)
-    }, 'Studentul nu a fost șters.')
+    }, 'Studentul nu a fost șters.', `Ștergi studentul ${fullName(student)}? Se șterg definitiv și prezența și notele lui.`)
   }
 
   const markAttendance = (student: TeacherStudent, status: AttendanceStatus) => {
     if (!selected) return
+    const newDate = rolledOverDate()
+    if (newDate) return setMessage(`Ziua s-a schimbat între timp. Acum completezi prezența pentru ${formatDayMonth(newDate)} — am reîncărcat-o, marchează din nou.`)
     const groupId = selected
     void run(async () => {
       // Only this student's entry is sent, so earlier marks for other students are not overwritten.
@@ -263,6 +316,8 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName }: P
     const score = Number(gradeValue.replace(',', '.'))
     if (gradeValue.trim() === '' || !Number.isFinite(score) || score < 0 || score > 10) return setMessage('Nota trebuie să fie un număr între 0 și 10.')
     if (!laboratory.trim()) return setMessage('Completează denumirea laboratorului.')
+    // The grade is stamped with the current date by the API; keep the displayed day in step with it.
+    rolledOverDate()
     void run(async () => {
       const saved = await saveLabGrade(student.id, laboratory, Math.round(score * 100) / 100)
       // One grade per laboratory: a repeated save replaces the previous one.

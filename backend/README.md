@@ -36,13 +36,15 @@ cu lista tuturor problemelor. Schema SQLite și cea PostgreSQL se creează autom
 ## Endpointuri
 
 Toate rutele `/api/*`, cu excepția health-check-ului, cer autentificare.
+Rutele `/api/teacher/*` cer în plus ca **modul Profesor să fie activ** în profil — altfel răspund `403`.
 
 | Metodă | Rută | Descriere |
 |---|---|---|
 | GET | `/health`, `/api/health` | Stare: `200` dacă SQLite merge; `status` = `ok` / `degraded` / `error`, `postgres` = `disabled` / `connecting` / `ready` / `error` |
-| GET | `/api/me` | Profilul (rol, `studentEnabled`, `teacherEnabled`) + datele Telegram |
-| PATCH | `/api/me` | Schimbă `role`, `studentEnabled`, `teacherEnabled` |
-| GET | `/api/week?date=YYYY-MM-DD` | Numărul și tipul săptămânii (`even`/`odd`); implicit data de azi la Chișinău |
+| GET | `/api/me` | Profilul (`role`, `studentEnabled`, `teacherEnabled`, `remindersEnabled`) + datele Telegram |
+| PATCH | `/api/me` | Schimbă `role`, `studentEnabled`, `teacherEnabled`, `remindersEnabled` |
+| GET | `/api/week?date=YYYY-MM-DD` | Săptămâna (`number`, `kind` = `even`/`odd`), semestrul care o conține (`inSemester`, `semesterStart`, `semesterEnd`), lista `semesters` din configurație și `nonWorkingDays` ale săptămânii afișate; implicit data de azi la Chișinău |
+| GET | `/api/non-working-days?from=&to=` | Zilele nelucrătoare dintr-un interval închis (maximum 400 de zile). Nu există rută de scriere — vezi „Semestre și zile nelucrătoare” |
 | GET | `/api/lessons` | Orele utilizatorului |
 | POST | `/api/lessons` | Adaugă o oră (maximum 500 per utilizator) → `201` |
 | PUT | `/api/lessons/:id` | Modifică o oră proprie → `404` dacă nu există |
@@ -51,9 +53,15 @@ Toate rutele `/api/*`, cu excepția health-check-ului, cer autentificare.
 | PATCH | `/api/notifications/read` | Marchează toate notificările ca citite → `204` |
 | GET | `/api/teacher/groups` | Grupele profesorului, cu `student_count` |
 | POST | `/api/teacher/groups` | Creează o grupă (`name`, `subject`; maximum 200; nume unic → altfel `409`) |
+| PATCH | `/api/teacher/groups/:groupId` | Redenumește grupa sau îi schimbă disciplina. Redenumirea **se propagă în orarul de Profesor** al proprietarului |
+| DELETE | `/api/teacher/groups/:groupId` | Șterge grupa, studenții, prezența și notele ei → `204`. Orele din orar rămân neatinse |
 | GET | `/api/teacher/groups/:groupId/students` | Studenții grupei |
 | POST | `/api/teacher/groups/:groupId/students` | Adaugă un student (`firstName`, `lastName`; maximum 500 per grupă) |
+| PATCH | `/api/teacher/students/:studentId` | Redenumește un student |
+| DELETE | `/api/teacher/students/:studentId` | Șterge un student, cu prezența și notele lui → `204` |
+| GET | `/api/teacher/groups/:groupId/attendance?date=` | Prezența grupei pe o dată |
 | POST | `/api/teacher/groups/:groupId/attendance` | Prezența pe o dată (`date`, `topic`, `entries[]` cu `studentId` și `status` = `present`/`absent`/`late`), tranzacțional → `204` |
+| GET | `/api/teacher/students/:studentId/grades` | Notele de laborator ale unui student |
 | POST | `/api/teacher/students/:studentId/grades` | Notă la laborator (`laboratory`, `grade` 0–10, `presentedOn`, `feedback`) |
 | POST | `/telegram/webhook` | Update-uri Telegram (doar în modul webhook, vezi mai jos) |
 
@@ -81,13 +89,14 @@ Exemplu complet: [`.env.example`](.env.example). În Docker Compose `NODE_ENV`, 
 | `TELEGRAM_POLLING` | `false` | `true` = long polling; altfel modul webhook |
 | `WEBHOOK_URL` | gol | URL `https://…/telegram/webhook` înregistrat automat la pornire |
 | `TELEGRAM_WEBHOOK_SECRET` | derivat | Secret webhook (`A-Z a-z 0-9 _ -`, max. 256); dacă lipsește se derivă din token (SHA-256) |
-| `INIT_DATA_MAX_AGE_SECONDS` | `86400` | Vârsta maximă a `initData` (60–2592000) |
+| `INIT_DATA_MAX_AGE_SECONDS` | `3600` | Vârsta maximă a `initData` (60–604800). `initData` e o credențială purtătoare fără revocare, deci fereastra se ține scurtă |
 | `ALLOWED_ORIGINS` | gol | Origini CORS separate prin virgulă; gol = fără CORS cross-origin |
 | `TRUST_PROXY` | `loopback, linklocal, uniquelocal` | Setarea Express `trust proxy` (`true`, `false`, număr de hop-uri sau listă) |
 | `RATE_LIMIT_PER_MINUTE` | `120` | Cereri/minut per utilizator; per IP limita este de 5×; `0` dezactivează |
 | `ALLOW_DEV_AUTH` | `false` | Acceptă `X-Dev-Telegram-Id` (doar dezvoltare) |
 | `DATABASE_PATH` | `./data/orar.sqlite` | Fișierul SQLite (în Docker: `/data/orar.sqlite`, volum) |
 | `DATABASE_URL` | gol | Conexiune PostgreSQL pentru Catalogul Profesor; gol = catalog dezactivat |
+| `SEMESTERS` | gol | Calendarul academic, `START:even\|odd[:END]` separate prin virgulă. Gol = un singur semestru deschis, 7 septembrie 2026, săptămână pară |
 
 Valorile booleene acceptă `1`, `true`, `yes`, `on`.
 
@@ -125,11 +134,12 @@ Implementare: `src/reminders.ts`, `src/schedule.ts`, planificare în `src/index.
 - Sunt verificate orele de ieri, azi și mâine (un memento poate trece de miezul nopții) cu
   `notificationsEnabled`, care se aplică în săptămâna respectivă (`even`/`odd`/`every`) și al căror
   rol nu este dezactivat în profil (`studentEnabled` / `teacherEnabled`).
-- Memento-ul pleacă când s-au atins `reminderMinutes` înainte de start, cu o fereastră de
-  toleranță de 5 minute pentru tick-uri întârziate (și pentru `reminderMinutes = 0`). Textul:
+- Memento-ul pleacă când s-au atins `reminderMinutes` înainte de start. Fereastra de recuperare
+  ține cât timp ora încă nu a început — `max(5, reminderMinutes)` minute — ca un restart sau un
+  deploy să nu piardă memento-ul; după start mai sunt tolerate 5 minute. Textul:
   „În N min: …”, „Acum începe: …” sau „A început acum N min: …”,
   cu ora, sala și grupa, plus butonul „Deschide orarul” dacă `MINI_APP_URL` e HTTPS.
-- Fiecare apariție (`lesson_id` + `data-ora`) este rezervată în `delivered_reminders`
+- Fiecare apariție (`lesson_id` + **data** ocurenței) este rezervată în `delivered_reminders`
   **înainte** de trimitere, deci restarturile sau tick-urile suprapuse nu dublează mesajele.
 - Erorile `400`/`403` de la Telegram (chat inexistent, bot blocat) sunt definitive; la alte erori
   rezervarea se anulează și memento-ul se reîncearcă la tick-ul următor, în fereastra de toleranță.
@@ -137,8 +147,25 @@ Implementare: `src/reminders.ts`, `src/schedule.ts`, planificare în `src/index.
 - Mentenanță zilnică la 04:17 (Chișinău): se șterg înregistrările de memento-uri mai vechi de
   14 zile și notificările mai vechi de 180 de zile.
 
-Paritatea săptămânilor: 7–13 septembrie 2026 este săptămâna nr. 1 și este **pară**; săptămânile
-încep lunea și alternează de acolo.
+## Semestre și zile nelucrătoare
+
+Paritatea săptămânilor **repornește la fiecare semestru**, ca să nu fie consumată de vacanțe.
+Calendarul se configurează prin `SEMESTERS`, fără recompilare; fiecare intrare e
+`START:even|odd[:END]`, unde `START` trebuie să fie o zi de luni. Cu valoarea implicită,
+7–13 septembrie 2026 este săptămâna nr. 1 și este **pară**, iar săptămânile alternează de acolo —
+exact comportamentul dinainte de introducerea semestrelor.
+
+O dată din afara oricărui semestru păstrează o paritate afișabilă (se prelungește ultimul semestru
+început), dar **nu produce memento-uri**.
+
+Zilele nelucrătoare stau în `non_working_days`. Sărbătorile legale ale Moldovei sunt semănate
+automat pentru anul curent și următorul, inclusiv cele mobile derivate din Paștele ortodox, care e
+calculat, nu scris de mână. O zi nelucrătoare **nu ascunde orele** — utilizatorul vede în
+continuare ce ar fi fost — dar oprește memento-urile acelei zile.
+
+Nu există rută de scriere pentru zilele nelucrătoare: aplicația nu are noțiune de administrator,
+iar o astfel de rută accesibilă oricui ar lăsa un singur utilizator să oprească memento-urile
+tuturor. Până la un model de administrator, zilele proprii se adaugă pe server.
 
 ## Build și teste
 

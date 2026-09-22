@@ -5,6 +5,12 @@
 #   --pull       git pull --ff-only before deploying
 #   --no-build   start with existing images (skip docker compose build)
 #   --timeout    seconds to wait for healthy containers (default 180)
+#
+# Before every build the current images are kept as orar-univer-{api,web}:prev, so a bad
+# release can be rolled back (they survive the `docker image prune -f` at the end):
+#   docker tag orar-univer-api:prev orar-univer-api:latest
+#   docker tag orar-univer-web:prev orar-univer-web:latest
+#   docker compose up -d          # see docs/DEPLOY.md, section 9
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,7 +24,7 @@ while [[ $# -gt 0 ]]; do
     --pull) PULL=1 ;;
     --no-build) BUILD=0 ;;
     --timeout) shift; TIMEOUT="${1:?--timeout needs a value}" ;;
-    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -79,15 +85,30 @@ chmod 600 .env backend/.env 2>/dev/null || true
 docker compose config --quiet || fail "docker compose config is invalid"
 
 # ---- Build & start ------------------------------------------------------------------
+# Keep the image that is live right now as `:prev`. Without a tag the rebuilt `:latest`
+# leaves the old image dangling and `docker image prune -f` (bottom of this script)
+# deletes it, making a rollback impossible. Same approach as deploy/serverhome/build.sh.
+keep_previous() {
+  local image="$1"
+  if docker image inspect "$image:latest" >/dev/null 2>&1; then
+    docker tag "$image:latest" "$image:prev" && log "  $image:latest kept as $image:prev"
+  fi
+}
+
 if [[ "$BUILD" -eq 1 ]]; then
-  log "Building images"
+  log "Building images (previous ones kept as :prev)"
+  keep_previous orar-univer-api
+  keep_previous orar-univer-web
   docker compose build --pull
 fi
 
 # The API runs as the unprivileged `node` user. Volumes created by older images
 # (running as root) may contain root-owned files; fix ownership idempotently.
+# The service drops ALL capabilities, so this one-off container has to add back the three
+# it needs: CHOWN (change owner), FOWNER/DAC_OVERRIDE (traverse root-owned directories).
 log "Ensuring /data volume is owned by the node user"
-docker compose run --rm --no-deps -T --user root --entrypoint sh api \
+docker compose run --rm --no-deps -T --user root \
+  --cap-add CHOWN --cap-add FOWNER --cap-add DAC_OVERRIDE --entrypoint sh api \
   -c 'find /data ! -user node -exec chown node:node {} + 2>/dev/null; true'
 
 log "Starting stack"
@@ -137,5 +158,6 @@ if command -v curl >/dev/null 2>&1; then
   fi
 fi
 
+# Removes only dangling images; orar-univer-{api,web}:prev are tagged, so they survive.
 docker image prune -f >/dev/null 2>&1 || true
 log "Deploy complete. Public URL: $(env_get backend/.env MINI_APP_URL)"

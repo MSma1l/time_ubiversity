@@ -16,7 +16,9 @@ ce rămâne deschis.
 | Frontend | 4 | 6 | — |
 | Infrastructură | 2 | 4 | — |
 
-Teste backend: de la **2** la **45** (8 fișiere). Frontend lint: **0** warning-uri.
+Teste backend: de la 2 teste la o suită care acoperă config, validare, API, bot, memento-uri și
+catalog (`npm test --prefix backend`; numărul crește la fiecare sesiune, de aceea nu e fixat aici).
+Frontend lint: **0** warning-uri.
 
 ## 1. Backend (reparat)
 
@@ -115,7 +117,7 @@ healthcheck-uri. Fișiere noi: `deploy/deploy.sh`, `deploy/backup.sh` (`pg_dump`
 
 Verificări rulate efectiv:
 
-- Backend: build + **45 teste** trecute.
+- Backend: build + suita Vitest completă (`npm test --prefix backend`), toate testele trecute.
 - Frontend: lint (0 warning-uri) + build reușit.
 - Imaginile Docker construite; stack pornit izolat — `postgres`, `api`, `web` toate `healthy`.
 - `/api/health` OK; cerere fără autentificare → 401; webhook fără secret → 401.
@@ -136,14 +138,14 @@ webhook real înregistrat la Telegram.
 
 | # | Problemă | Impact / notă |
 |---|---|---|
-| D1 | Prezența nu se reîncarcă la redeschiderea catalogului. | Backend-ul nu are endpoint de citire a prezenței; profesorul nu vede ce a salvat anterior. |
+| D1 | ~~Prezența nu se reîncarcă la redeschiderea catalogului.~~ | **Rezolvat** (valul 3): există `GET /api/teacher/groups/:groupId/attendance`; prezența salvată se revede la redeschidere. |
 | D3 | Memento-urile din nopțile de schimbare a orei (DST) pot fi decalate cu o oră. | Rar, de două ori pe an. |
 | D4 | Offset-ul de polling Telegram nu este persistat. | După un crash, un update poate fi procesat de două ori. |
 | D5 | Oricine își poate alege rolul Profesor. | By design; datele catalogului sunt izolate per proprietar. |
 | D6 | Scriptul Telegram (`telegram-web-app.js`) injectează un `<style>` inline în Telegram Web. | Nu este blocat: CSP-ul actual din `frontend/nginx.conf` permite `'unsafe-inline'` la `style-src`. Compromis acceptat; eliminarea lui ar necesita hash-uri/nonce pentru stiluri. |
 | D7 | `createdAt` al notificărilor este salvat fără fus orar. | Tratat în frontend la afișare; ideal ar fi ISO cu offset din backend. |
-| D8 | Nu există endpoint-uri pentru ștergerea grupelor/studenților sau citirea notelor. | Funcționalitate de adăugat ulterior. |
-| D9 | Comanda bot `/notificari on\|off` suprascrie setarea fiecărei lecții. | Alegerile per lecție se pierd la folosirea comenzii. |
+| D8 | ~~Nu există endpoint-uri pentru ștergerea grupelor/studenților sau citirea notelor.~~ | **Rezolvat** (valul 3): `DELETE`/`PATCH` pe grupe și studenți, `GET` pe note. |
+| D9 | ~~Comanda bot `/notificari on\|off` suprascrie setarea fiecărei lecții.~~ | **Rezolvat** (valul 3): comanda comută doar `profiles.reminders_enabled`; setările per lecție rămân intacte. |
 | D10 | Rate limit-ul este în memorie. | Corect pentru o singură instanță `api`; la scalare orizontală ar trebui Redis. |
 
 ## 6. Salvarea orarului și separarea Student / Profesor
@@ -170,7 +172,7 @@ are câmp de final, validare locală și trimite rolul lecției — eroarea nu m
 Verificat: scenariu UI în Chrome headless (dev auth) — creare/editare/ștergere ca Student și
 Profesor, 08:00/09:30/13:15/18:00, pară/impară/fiecare, câmpuri opționale goale, memento oprit,
 reîncărcare: toate persistă și rămân separate; DB creată cu schema veche se deschide cu orele
-vizibile în rolul corect. Teste backend: 52.
+vizibile în rolul corect.
 
 ## 7. Al treilea val de reparații
 
@@ -184,4 +186,26 @@ vizibile în rolul corect. Teste backend: 52.
 | Catalog | GET prezență și note (se văd după redeschidere); notă unică per laborator (upsert); nume de grupă unice fără diferență de majuscule; redenumire/ștergere grupe și studenți; 503 când Postgres cade, 400 pentru date invalide; layout mobil cu tastatură. |
 | Notificări | Reîncărcate la deschiderea panoului și la revenirea în aplicație. |
 
-Teste backend: **65** trecute (+7 care rulează doar cu `DATABASE_URL_TEST`). Frontend: lint 0 warning-uri, build OK.
+Teste backend: suita completă trecută (testele de catalog rulează doar cu `DATABASE_URL_TEST`,
+altfel sunt sărite). Frontend: lint 0 warning-uri, build OK.
+
+## 8. Al patrulea și al cincilea val — constatări anterioare închise
+
+Tabelul păstrează constatarea așa cum a fost formulată și adaugă starea ei de acum, ca să se vadă
+evoluția. Reparațiile sunt verificabile în fișierele indicate.
+
+| # | Constatarea anterioară | Starea actuală |
+|---|---|---|
+| A1 | Paritatea săptămânii pornea de la o **ancoră unică hardcodată în cod** (`2026-09-07`, pară), cu un contor care curgea la infinit: vacanța de iarnă consuma paritate, deci semestrul II putea ieși inversat, iar anul universitar următor era pură extrapolare. | **Rezolvat.** Semestrele se citesc din variabila `SEMESTERS` (`START:even\|odd[:END]`, separate prin virgulă), validată la pornire în `config.ts` / `schedule.ts`: `START` trebuie să fie luni, `END` e inclusiv și poate lipsi doar la ultima intrare, semestrele nu se pot suprapune. **Paritatea și numerotarea repornesc la fiecare semestru.** Valoarea goală păstrează exact comportamentul dinainte. Rămâne o sarcină de operare: variabila trebuie completată la începutul fiecărui an universitar (`docs/DEPLOY.md`, 3.3). |
+| A2 | **Noțiunea de zi liberă nu exista**: cron-ul trimitea memento-uri și de 1 Mai, și în vacanța de vară. | **Rezolvat.** Două tabele noi în SQLite (`non_working_days`, `non_working_seeds`): sărbătorile legale ale Moldovei sunt semănate automat pentru anul curent și următorul — cele cu dată fixă și cele mobile, derivate din Paștele ortodox calculat (`orthodoxEaster`) — iar administratorul poate adăuga zile pe server. Semănatul e idempotent de două ori (anul e notat în `non_working_seeds`, inserarea e `INSERT OR IGNORE`), deci o sărbătoare ștearsă intenționat nu reapare. Perioadele din afara semestrelor sunt nelucrătoare prin construcție, fără să fie enumerate. Comportament: **orele rămân vizibile, tac doar memento-urile.** |
+| A3 | `profile.timezone` era **câmp mort**: returnat de `GET /api/me`, nefolosit de nimic. | **Rezolvat.** Scos din model (`profile.ts`) și din răspunsul API (`publicProfile` listează explicit câmpurile expuse, ca o coloană internă să nu mai poată scăpa în răspuns). Motivul e de fond: orarul e al universității, deci un student aflat în altă țară tot la ora Chișinăului are cursul — un fus personal ar produce memento-uri la ora greșită. Coloana veche rămâne în bazele existente, inofensivă, pentru că nu mai e citită. |
+| A4 | Redenumirea unei grupe în catalog **nu atingea orarul**: legătura fiind pe nume, orele rămâneau agățate de numele vechi, iar următoarea salvare a unei ore recrea numele vechi ca **a doua grupă, goală**. | **Rezolvat.** `PATCH /api/teacher/groups/:groupId` redenumește grupa și în orarul de Profesor al proprietarului (`renameLessonGroup`), inclusiv când se schimbă doar majusculele. Ordinea scrierilor e aleasă intenționat: SQLite se redenumește în interiorul tranzacției PostgreSQL, chiar înainte de COMMIT — un eșec pe SQLite face rollback la catalog (nu se schimbă nimic nicăieri), iar dacă eșuează doar COMMIT-ul, repetarea aceleiași cereri repară situația. Ordinea inversă n-ar fi fost reparabilă: numele vechi ar fi dispărut din catalog și nicio cerere n-ar mai fi găsit orele. |
+| A5 | **TOCTOU pe limite**: `COUNT` și `INSERT` erau separate de `await`-uri, deci două cereri paralele ale aceluiași profesor, la `limită − 1`, treceau amândouă de verificare și depășeau limita de grupe / de studenți. | **Rezolvat.** Scrierile sunt serializate cu advisory lock-uri PostgreSQL pe tranzacție: `lockOwnerCatalog` (scrierile de catalog ale unui proprietar — creare, redenumire, sincronizarea din orar) și `lockCatalogGroup` (crearea de studenți într-o grupă). Namespace-urile sunt fixe și disjuncte, iar o tranzacție ia cel mult unul și nu apelează cod care ar lua altul, deci nu se pot bloca reciproc. |
+| A6 | Imaginile de bază erau **nefixate**: două build-uri ale aceluiași commit puteau produce straturi diferite, iar un rollback nu era reproductibil. | **Rezolvat.** `node:22-alpine`, `nginx:1.27-alpine` și `postgres:16-alpine` sunt fixate pe digest-ul **manifestului multi-arhitectură** în `backend/Dockerfile`, `frontend/Dockerfile`, `docker-compose.yml` și `deploy/serverhome/compose.yaml`. Compromisul asumat: `docker build --pull` nu mai aduce singur patch-urile de securitate ale imaginii de bază, deci digest-urile se ridică manual, lunar — procedura completă (cum se află digest-ul, cum se verifică înainte de a-l scrie, ce se controlează după deploy) e în `docs/DEPLOY.md`, secțiunea 9.1. |
+| A7 | Fereastra de acceptare `initData` era de **24 de ore**. | **Rezolvat.** Implicit **1 oră** (`INIT_DATA_MAX_AGE_SECONDS`, interval acceptat 60..604800). `initData` e o credențială de tip bearer, fără mecanism de revocare, deci fereastra de replay stă scurtă. |
+| A8 | Rutele `/api/teacher/*` erau accesibile oricărui utilizator autentificat; apartenența la modul Profesor era doar o convenție de interfață. | **Rezolvat.** Un middleware montat pe `/api/teacher` cere `teacherEnabled` în profil și răspunde **403** altfel — regula e impusă pe server, nu în interfață. Izolarea pe `owner_id` de la fiecare interogare rămâne neschimbată. |
+| A9 | Cheia de deduplicare a memento-urilor includea și ora ocurenței, deci **mutarea orei re-arma un memento deja trimis** în aceeași zi. | **Rezolvat.** Cheia e acum **doar data** (`YYYY-MM-DD`): o lecție are o singură oră de început pe zi, deci editarea ei nu mai poate declanșa un al doilea mesaj. Formatul păstrează valabilă și comparația cu pragul de curățare din `pruneDatabase`. |
+| A10 | `deploy/serverhome/compose.yaml` folosea `env_file: .env`, deci împingea în containerul API tot fișierul, inclusiv `POSTGRES_PASSWORD`, pe care API-ul nu-l citește niciodată și pe care `docker inspect` îl expunea. | **Rezolvat.** Serviciul `api` are o listă explicită de variabile sub `environment:`, alimentată tot din același `.env` prin interpolare. Costul, documentat acum în `deploy/serverhome/README.md`: **o variabilă nouă a aplicației trebuie adăugată în două locuri** (`.env.example` și lista din `compose.yaml`), altfel nu ajunge în container. |
+
+Verificat pentru acest val: `docker compose -f deploy/serverhome/compose.yaml config -q` trece, iar
+`SEMESTERS` apare în mediul rezolvat al serviciului `api` (cu virgulele intacte).

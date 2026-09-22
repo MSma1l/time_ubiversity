@@ -1,3 +1,5 @@
+import { parseSemesters, type Semester } from "./schedule.js";
+
 export type AppConfig = {
   production: boolean;
   port: number;
@@ -14,6 +16,8 @@ export type AppConfig = {
   trustProxy: string | number | boolean;
   initDataMaxAgeSeconds: number;
   rateLimitPerMinute: number;
+  /** Teaching periods, in order; parity restarts at every semester (see schedule.ts). */
+  semesters: Semester[];
 };
 
 export class ConfigError extends Error {
@@ -66,6 +70,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (webhookUrl && !/^https:\/\/[^\s]+$/i.test(webhookUrl)) problems.push("WEBHOOK_URL must be an https:// URL");
   if (webhookSecret && !/^[A-Za-z0-9_-]{1,256}$/.test(webhookSecret)) problems.push("TELEGRAM_WEBHOOK_SECRET may contain only A-Z, a-z, 0-9, _ and - (max 256 chars)");
 
+  // Format: START:even|odd[:END], comma separated — "2026-09-07:even:2026-12-20,2027-02-08:even:2027-05-30".
+  // An empty value keeps the built-in default (schedule.ts). Helpers read the variable themselves, so the
+  // validation here is what turns a typo into a startup error instead of a silently wrong parity.
+  const { semesters, problems: semesterProblems } = parseSemesters(env.SEMESTERS);
+  problems.push(...semesterProblems);
+
   const config: AppConfig = {
     production,
     port: integer(env, "PORT", 3001, 1, 65_535, problems),
@@ -80,8 +90,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     webhookUrl,
     webhookSecret,
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
-    initDataMaxAgeSeconds: integer(env, "INIT_DATA_MAX_AGE_SECONDS", 86_400, 60, 30 * 86_400, problems),
-    rateLimitPerMinute: integer(env, "RATE_LIMIT_PER_MINUTE", 120, 0, 100_000, problems)
+    // One hour: `initData` is a bearer credential with no revocation, so the replay window stays short.
+    initDataMaxAgeSeconds: integer(env, "INIT_DATA_MAX_AGE_SECONDS", 3_600, 60, 7 * 86_400, problems),
+    rateLimitPerMinute: integer(env, "RATE_LIMIT_PER_MINUTE", 120, 0, 100_000, problems),
+    semesters
   };
   if (problems.length) throw new ConfigError(problems);
   return config;

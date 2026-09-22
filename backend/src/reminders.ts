@@ -1,6 +1,6 @@
-import { addNotification, LESSON_COLUMNS, toLesson, type Lesson, type SqliteDatabase } from "./db.js";
+import { addNotification, LESSON_COLUMNS, nonWorkingDays, toLesson, type Lesson, type SqliteDatabase } from "./db.js";
 import { minutesLabel } from "./labels.js";
-import { chisinauClock, dueReminderOccurrence } from "./schedule.js";
+import { addDays, chisinauClock, dueReminderOccurrence, isTeachingDay } from "./schedule.js";
 import { TelegramApiError } from "./telegram.js";
 
 export type ReminderSender = (chatId: number, text: string) => Promise<void>;
@@ -13,7 +13,9 @@ function lessonDetails(lesson: Lesson) {
  * Sends reminders that became due. Each occurrence is reserved in `delivered_reminders`
  * *before* sending, so overlapping ticks, restarts or a second instance on the same
  * database can never deliver the same reminder twice. Profiles with `reminders_enabled=0`
- * (bot /notificari off) and disabled Student/Profesor modes receive nothing.
+ * (bot /notificari off) and disabled Student/Profesor modes receive nothing. Days without classes
+ * — public holidays, days an administrator marked, and anything outside a semester — are skipped;
+ * the lessons stay visible in the schedule, only the reminder is not sent.
  */
 export async function sendDueReminders(db: SqliteDatabase, send: ReminderSender, now = new Date(), log: Pick<Console, "error"> = console) {
   const clock = chisinauClock(now);
@@ -24,13 +26,18 @@ export async function sendDueReminders(db: SqliteDatabase, send: ReminderSender,
     WHERE l.weekday IN (?, ?, ?) AND l.notifications_enabled=1 AND COALESCE(p.reminders_enabled,1)=1
       AND NOT (l.role='student' AND COALESCE(p.student_enabled,1)=0) AND NOT (l.role='teacher' AND COALESCE(p.teacher_enabled,1)=0)`)
     .all(yesterday, clock.weekday, tomorrow) as Parameters<typeof toLesson>[0][];
+  // Only three dates can be due (see dueReminderOccurrence), so one query per tick is enough.
+  const holidays = nonWorkingDays(db, [-1, 0, 1].map((offset) => addDays(clock.date, offset)));
   const reserve = db.prepare("INSERT OR IGNORE INTO delivered_reminders (lesson_id, occurrence_key) VALUES (?,?)");
   const release = db.prepare("DELETE FROM delivered_reminders WHERE lesson_id=? AND occurrence_key=?");
   let sent = 0;
   for (const lesson of rows.map(toLesson)) {
     const due = dueReminderOccurrence(lesson, clock);
-    if (!due) continue;
-    const key = `${due.date}-${lesson.startTime}`;
+    if (!due || holidays.has(due.date) || !isTeachingDay(due.date)) continue;
+    // The date alone is the occurrence key: a lesson has one start time per day, so editing that
+    // time must not re-arm a reminder already delivered today. (The primary key is (lesson_id, key),
+    // and `pruneDatabase` compares the key with a YYYY-MM-DD cutoff, which this format keeps valid.)
+    const key = due.date;
     if (!reserve.run(lesson.id, key).changes) continue;
     const heading = due.minutesUntilStart > 0 ? `În ${minutesLabel(due.minutesUntilStart)}: ${lesson.title}`
       : due.minutesUntilStart < 0 ? `A început acum ${minutesLabel(-due.minutesUntilStart)}: ${lesson.title}` : `Acum începe: ${lesson.title}`;

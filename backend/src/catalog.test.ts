@@ -3,7 +3,7 @@ import type { Server } from "node:http";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { academicDatabase, closeAcademicDatabase, ensureAcademicSchema, isConnectionError } from "./academic.js";
-import { createApp } from "./app.js";
+import { createApp, LIMITS } from "./app.js";
 import { loadConfig } from "./config.js";
 import { openDatabase, type SqliteDatabase } from "./db.js";
 import { backfillAllCatalogGroups, isOwnerSynced } from "./groupSync.js";
@@ -222,7 +222,7 @@ describe.skipIf(!databaseUrl)("Teacher Catalog API (PostgreSQL)", () => {
     expect((await groupsOf("4004")).length).toBe(3);
   });
 
-  it("does not recreate deleted groups on GET; a later lesson save does; rename/delete never touch lessons", async () => {
+  it("does not recreate deleted groups on GET; a later lesson save does; deleting one never touches lessons", async () => {
     const before = await groupsOf("4004");
     const ibm = before.find((group) => group.name === "IBM-261")!;
     expect((await remove(`/api/teacher/groups/${ibm.id}`, "4004")).status).toBe(204);
@@ -240,14 +240,50 @@ describe.skipIf(!databaseUrl)("Teacher Catalog API (PostgreSQL)", () => {
     expect((await api(`/api/lessons/${saved.body.id}`, { method: "PUT", body: JSON.stringify({ ...withoutRole, title: "TPA", groupName: "TI-231" }) }, "4004")).status).toBe(200);
     expect((await groupsOf("4004")).find((group) => group.name === "TI-231")).toMatchObject({ subject: "TPA", linkedLessons: 1, subjects: ["TPA"] });
 
+    // Deleting a group deletes no lesson: the schedule keeps the name and a later save recreates the group.
     const lessonsBefore = (await api("/api/lessons?role=teacher", {}, "4004")).body;
-    const sad = (await groupsOf("4004")).find((group) => group.name === "Sad-262")!;
-    const renamed = await patch(`/api/teacher/groups/${sad.id}`, { name: "Sad-262 A" }, "4004");
-    expect(renamed.body).toMatchObject({ name: "Sad-262 A", linkedLessons: 0, subjects: [] });
-    expect((await remove(`/api/teacher/groups/${sad.id}`, "4004")).status).toBe(204);
+    const ti = (await groupsOf("4004")).find((group) => group.name === "TI-231")!;
+    expect((await remove(`/api/teacher/groups/${ti.id}`, "4004")).status).toBe(204);
     expect((await api("/api/lessons?role=teacher", {}, "4004")).body).toEqual(lessonsBefore);
-    const created = await post("/api/teacher/groups", { name: "SAD-262" }, "4004");
-    expect(created.body).toMatchObject({ name: "SAD-262", linkedLessons: 2, subjects: ["Laborator TPA", "TPA"] });
+  });
+
+  type TeacherLesson = { id: number, title: string, groupName: string | null, room: string | null };
+  const lessonsOf = async (user: string, role: string) => (await api(`/api/lessons?role=${role}`, {}, user)).body as TeacherLesson[];
+
+  it("renames the group in the Profesor schedule, so a later lesson save creates no empty duplicate", async () => {
+    // The real scenario: a group with a register (students) renamed in the catalog, then the lesson edited.
+    const before = await groupsOf("4004");
+    const sad = before.find((group) => group.name === "Sad-262")!;
+    expect(sad).toMatchObject({ linkedLessons: 2, subjects: ["Laborator TPA", "TPA"] });
+    expect((await post(`/api/teacher/groups/${sad.id}/students`, { firstName: "Ana", lastName: "Rusu" }, "4004")).status).toBe(201);
+    // A Student lesson with the same group name: the other schedule must stay as it is.
+    expect((await post("/api/lessons", { ...lessonBody, role: "student", groupName: "Sad-262" }, "4004")).status).toBe(201);
+
+    const renamed = await patch(`/api/teacher/groups/${sad.id}`, { name: "Sad-262 A" }, "4004");
+    expect(renamed.body).toMatchObject({ id: sad.id, name: "Sad-262 A", linkedLessons: 2, subjects: ["Laborator TPA", "TPA"], student_count: 1 });
+    const teacherLessons = await lessonsOf("4004", "teacher");
+    expect(teacherLessons.filter((item) => item.groupName === "Sad-262 A")).toHaveLength(2);
+    expect(teacherLessons.some((item) => item.groupName === "Sad-262")).toBe(false);
+    expect((await lessonsOf("4004", "student")).some((item) => item.groupName === "Sad-262")).toBe(true);
+
+    // Editing one of those lessons (only the room changes) must not recreate the old name as a second group.
+    const lesson = teacherLessons.find((item) => item.groupName === "Sad-262 A")!;
+    const { role: _role, ...withoutRole } = lessonBody;
+    const saved = await api(`/api/lessons/${lesson.id}`, { method: "PUT", body: JSON.stringify({ ...withoutRole, title: lesson.title, groupName: "Sad-262 A", room: "301" }) }, "4004");
+    expect(saved.status).toBe(200);
+    const after = await groupsOf("4004");
+    expect(after.map((group) => group.name).filter((name) => name.toLowerCase().startsWith("sad-262"))).toEqual(["Sad-262 A"]);
+    expect(after).toHaveLength(before.length);
+    expect(after.find((group) => group.id === sad.id)).toMatchObject({ linkedLessons: 2, student_count: 1 });
+
+    // A rename that changes only the letter case still updates the text shown in the schedule.
+    const upper = await patch(`/api/teacher/groups/${sad.id}`, { name: "SAD-262 A" }, "4004");
+    expect(upper.body).toMatchObject({ name: "SAD-262 A", linkedLessons: 2, student_count: 1 });
+    expect((await lessonsOf("4004", "teacher")).filter((item) => item.groupName === "SAD-262 A")).toHaveLength(2);
+    expect((await groupsOf("4004")).map((group) => group.name).filter((name) => name.toLowerCase() === "sad-262 a")).toEqual(["SAD-262 A"]);
+    // Changing only the subject leaves both the group name and the lessons alone.
+    expect((await patch(`/api/teacher/groups/${sad.id}`, { subject: "TPA" }, "4004")).body).toMatchObject({ name: "SAD-262 A", subject: "TPA", linkedLessons: 2 });
+    expect((await lessonsOf("4004", "teacher")).filter((item) => item.groupName === "SAD-262 A")).toHaveLength(2);
   });
 
   it("saves the lesson (201) when PostgreSQL is down during the group sync", async () => {
@@ -259,20 +295,54 @@ describe.skipIf(!databaseUrl)("Teacher Catalog API (PostgreSQL)", () => {
     spy.mockRestore();
     const groups = await groupsOf("4004");
     expect(groups.find((group) => group.name === "TI-999")).toBeUndefined();
-    expect(groups.find((group) => group.name === "SAD-262")).toBeDefined();
+    expect(groups.find((group) => group.name === "SAD-262 A")).toBeDefined();
   });
 
-  it("startup backfill imports unsynced owners only and respects the group limit", async () => {
+  it("startup backfill imports unsynced owners only and retries an import the group limit truncated", async () => {
     legacyLesson(5005, "teacher", "PC", "A-1");
     legacyLesson(5005, "teacher", "PC", "B-1");
     legacyLesson(5005, "teacher", "PC", "C-1");
+    // Read straight from PostgreSQL: GET /api/teacher/groups would itself run the backfill.
+    const namesOf = async (ownerId: number) =>
+      (await academicDatabase(databaseUrl)!.query("SELECT name FROM academic_groups WHERE owner_id=$1 ORDER BY lower(name)", [ownerId])).rows.map((row) => row.name as string);
     const logged: string[] = [];
     await backfillAllCatalogGroups(sqlite, databaseUrl, 2, undefined, { ...silent, warn: (...args: unknown[]) => { logged.push(args.join(" ")); } });
     expect(logged.some((line) => line.includes("skipped 1 group(s): C-1"))).toBe(true);
-    expect(isOwnerSynced(sqlite, 5005)).toBe(true);
-    expect((await groupsOf("5005")).map((group) => group.name)).toEqual(["A-1", "B-1"]);
-    // Owner 4004 is already synced: the TI-999 lesson saved while PostgreSQL was down is not re-imported.
+    expect(await namesOf(5005)).toEqual(["A-1", "B-1"]);
+    // The import is incomplete, so the owner is NOT marked as synced: C-1 must not be lost forever.
+    expect(isOwnerSynced(sqlite, 5005)).toBe(false);
+    // A later run with a larger limit finishes the import and only then marks the owner.
     await backfillAllCatalogGroups(sqlite, databaseUrl, 200, undefined, silent);
+    expect(isOwnerSynced(sqlite, 5005)).toBe(true);
+    expect((await groupsOf("5005")).map((group) => group.name)).toEqual(["A-1", "B-1", "C-1"]);
+    // Owner 4004 is already synced: the TI-999 lesson saved while PostgreSQL was down is not re-imported.
     expect((await groupsOf("4004")).find((group) => group.name === "TI-999")).toBeUndefined();
+  });
+
+  it("keeps the group and student limits under parallel requests (one 201, one 409)", async () => {
+    const user = "6060";
+    const groups = LIMITS.groupsPerTeacher, students = LIMITS.studentsPerGroup;
+    try {
+      // Two parallel creates with one free slot: the COUNT of one must not run before the INSERT of the other.
+      LIMITS.groupsPerTeacher = 1;
+      const created = await Promise.all([post("/api/teacher/groups", { name: "P-1" }, user), post("/api/teacher/groups", { name: "P-2" }, user)]);
+      expect(created.map((response) => response.status).sort()).toEqual([201, 409]);
+      expect(created.find((response) => response.status === 409)!.body.error).toMatch(/limita de 1 grupe/);
+      LIMITS.groupsPerTeacher = groups;
+      const groupId = created.find((response) => response.status === 201)!.body.id as string;
+      expect((await groupsOf(user))).toHaveLength(1);
+
+      LIMITS.studentsPerGroup = 1;
+      const enrolled = await Promise.all([
+        post(`/api/teacher/groups/${groupId}/students`, { firstName: "Ana", lastName: "Rusu" }, user),
+        post(`/api/teacher/groups/${groupId}/students`, { firstName: "Ion", lastName: "Albu" }, user)
+      ]);
+      expect(enrolled.map((response) => response.status).sort()).toEqual([201, 409]);
+      expect(enrolled.find((response) => response.status === 409)!.body.error).toMatch(/limita de 1 studenți/);
+      expect((await api(`/api/teacher/groups/${groupId}/students`, {}, user)).body).toHaveLength(1);
+    } finally {
+      LIMITS.groupsPerTeacher = groups;
+      LIMITS.studentsPerGroup = students;
+    }
   });
 });

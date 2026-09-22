@@ -1,7 +1,12 @@
 # syntax=docker/dockerfile:1
 
+# Base images are pinned to the multi-arch manifest digest (tag + @sha256) so the same
+# commit always rebuilds byte-identical layers. The tag is kept for readability only;
+# the digest wins. Refresh procedure (security patches): docs/DEPLOY.md,
+# section 9.1 "Reimprospatarea imaginilor de baza fixate pe digest".
+
 # ---- Build stage: compile TypeScript and native modules --------------------
-FROM node:22-alpine AS build
+FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 AS build
 WORKDIR /app
 
 # Toolchain for better-sqlite3 in case no prebuilt musl binary matches.
@@ -17,7 +22,7 @@ RUN npm run build \
  && npm cache clean --force
 
 # ---- Runtime stage ----------------------------------------------------------
-FROM node:22-alpine AS runtime
+FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 AS runtime
 
 # tini reaps zombies and forwards SIGTERM so `docker stop` shuts down cleanly.
 RUN apk add --no-cache tini
@@ -35,8 +40,10 @@ COPY --from=build --chown=node:node /app/dist ./dist
 
 # The SQLite volume must be writable by the unprivileged user. A fresh named
 # volume inherits this ownership from the image.
+# No `VOLUME ["/data"]`: it would create an anonymous volume on any `docker run` without
+# `-v`, and the SQLite database would vanish on `docker rm`. Compose does the mounting
+# (named volume or bind mount).
 RUN mkdir -p /data && chown node:node /data
-VOLUME ["/data"]
 
 USER node
 EXPOSE 3001

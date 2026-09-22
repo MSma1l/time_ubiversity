@@ -1,6 +1,7 @@
 import { miniAppButton, type AppConfig } from "./config.js";
 import { lessonRows, upsertProfile, type Lesson, type SqliteDatabase } from "./db.js";
 import { ProfileRuleError, readProfile, updateProfile } from "./profile.js";
+import { createRateLimiter } from "./rateLimit.js";
 import { appliesInWeek, chisinauClock, universityWeekKind } from "./schedule.js";
 import { sleep } from "./util.js";
 import { deriveWebhookSecret, telegramApi, telegramApiResponse, TelegramApiError, type TelegramUser } from "./telegram.js";
@@ -25,7 +26,13 @@ export const BOT_COMMANDS = [
 
 const HELP_TEXT = `Bun venit la ${APP_NAME}!\n\n/azi — orarul de azi\n/saptamana — orarul săptămânii curente\n/rol student|profesor — schimbă modul activ\n/notificari on|off — pornește/oprește memento-urile\n/status — starea contului`;
 const FREE_TEXT_REPLY = `Sunt botul ${APP_NAME} și răspund doar la comenzi. Trimite /help pentru lista comenzilor sau deschide orarul în aplicație.`;
-const ROLE_ARGUMENTS: Record<string, Lesson["role"]> = { student: "student", profesor: "teacher", teacher: "teacher" };
+// A Map (not an object literal) so `/rol __proto__` or `/rol constructor` cannot reach Object.prototype.
+const ROLE_ARGUMENTS = new Map<string, Lesson["role"]>([["student", "student"], ["profesor", "teacher"], ["teacher", "teacher"]]);
+
+/** Bot commands accepted per sender each minute; extra messages are dropped without an answer. */
+export const BOT_COMMAND_LIMIT = 20;
+/** Flood guard shared by the webhook route and the polling loop (neither passes through /api). */
+export const botCommandLimiter = createRateLimiter(BOT_COMMAND_LIMIT);
 
 function formatLesson(lesson: Lesson) { return `• ${lesson.startTime}–${lesson.endTime} — ${lesson.title}${lesson.room ? ` (sala ${lesson.room})` : ""}`; }
 
@@ -56,7 +63,7 @@ export function botReply(db: SqliteDatabase, message: TelegramMessage | undefine
     const entries = lessonRows(db, userId, role).filter((lesson) => appliesInWeek(lesson.weekKind, clock.date));
     answer = entries.length ? `📅 Săptămâna ${kindLabel} · ${ROLE_NAMES[role]}:\n${entries.map((lesson) => `${["Lu", "Ma", "Mi", "Jo", "Vi", "Sâ", "Du"][lesson.weekday - 1]} ${formatLesson(lesson)}`).join("\n")}` : `Nu ai ore în această săptămână în orarul de ${ROLE_NAMES[role]}.`;
   } else if (command === "/rol") {
-    const requested = ROLE_ARGUMENTS[argument];
+    const requested = ROLE_ARGUMENTS.get(argument);
     if (!requested) answer = `Folosește: /rol student sau /rol profesor.\nMod activ: ${ROLE_NAMES[role]}.`;
     else {
       try {
@@ -80,9 +87,26 @@ export function botReply(db: SqliteDatabase, message: TelegramMessage | undefine
 
 export async function handleBotMessage(db: SqliteDatabase, config: AppConfig, message: TelegramMessage | undefined, signal?: AbortSignal) {
   if (!config.token) return;
+  const senderId = message?.from?.id;
+  // Checked before any SQLite write; over the limit we stay silent, since answering amplifies the flood.
+  if (Number.isSafeInteger(senderId) && botCommandLimiter.hit(String(senderId))) return;
   const reply = botReply(db, message);
   if (!reply) return;
-  await telegramApi(config.token, "sendMessage", { chat_id: reply.chatId, text: reply.text, reply_markup: miniAppButton(config, "Deschide orarul") }, signal);
+  await sendMessage(config, { chat_id: reply.chatId, text: reply.text, reply_markup: miniAppButton(config, "Deschide orarul") }, signal);
+}
+
+/** Sends one reply, retrying exactly once on a transient 429/5xx so the answer is not lost. */
+async function sendMessage(config: AppConfig, payload: Record<string, unknown>, signal?: AbortSignal) {
+  try {
+    await telegramApi(config.token, "sendMessage", payload, signal);
+  } catch (error) {
+    const transient = error instanceof TelegramApiError && (error.status === 429 || error.status >= 500);
+    if (!transient) throw error;
+    const retryAfter = (error as TelegramApiError).retryAfterSeconds;
+    await sleep(retryAfter ? Math.min(retryAfter, 30) * 1_000 : 500, signal);
+    if (signal?.aborted) return;
+    await telegramApi(config.token, "sendMessage", payload, signal);
+  }
 }
 
 /** Registers the Romanian command menu once at startup. Failures are logged and ignored. */
@@ -117,6 +141,12 @@ export async function configureWebhook(config: AppConfig, signal: AbortSignal, l
   }
 }
 
+/** Guards a malformed getUpdates payload so the log names the cause instead of a generic TypeError. */
+export function asUpdateList(result: unknown): TelegramUpdate[] {
+  if (!Array.isArray(result)) throw new Error(`Telegram getUpdates returned an unexpected payload (expected an array, got ${result === null ? "null" : typeof result})`);
+  return result as TelegramUpdate[];
+}
+
 /** Polling delay after a failed getUpdates call. */
 export function pollingBackoff(error: unknown, previousDelayMs: number): number {
   if (error instanceof TelegramApiError) {
@@ -140,7 +170,7 @@ export function startPolling(db: SqliteDatabase, config: AppConfig, log: Pick<Co
     let offset = 0; let delay = 0;
     while (!signal.aborted) {
       try {
-        const updates = await telegramApiResponse<TelegramUpdate[]>(config.token, "getUpdates", { offset, timeout: 25, allowed_updates: ["message"] }, signal);
+        const updates = asUpdateList(await telegramApiResponse<unknown>(config.token, "getUpdates", { offset, timeout: 25, allowed_updates: ["message"] }, signal));
         delay = 0;
         for (const update of updates) {
           offset = Math.max(offset, update.update_id + 1);

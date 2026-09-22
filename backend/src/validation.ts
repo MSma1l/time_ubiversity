@@ -71,11 +71,24 @@ export const groupPatchSchema = z.object({
 }).refine(hasChanges, atLeastOne);
 export const studentSchema = z.object({ firstName: text(1, 80), lastName: text(1, 80) });
 export const studentPatchSchema = z.object({ firstName: text(1, 80).optional(), lastName: text(1, 80).optional() }).refine(hasChanges, atLeastOne);
+/** POST /api/teacher/groups/:groupId/attendance — a missing `topic` keeps the saved one, `null` or "" clears it. */
 export const attendanceSchema = z.object({
-  date: catalogDateSchema, topic: optionalText(160),
+  date: catalogDateSchema,
+  topic: text(0, 160).nullable().optional().transform((value) => (value === undefined ? undefined : value || null)),
   entries: z.array(z.object({ studentId: z.uuid(), status: z.enum(["present", "absent", "late"]) })).max(500)
 });
 export const gradeSchema = z.object({
   laboratory: text(1, 120), grade: z.number().min(0).max(10),
-  presentedOn: catalogDateSchema.optional(), feedback: z.string().trim().max(500).optional().transform((value) => (value ? value : null))
+  presentedOn: catalogDateSchema.optional(), feedback: optionalText(500)
 });
+
+/**
+ * GET /api/non-working-days?from=…&to=… — a closed interval, at most `MAX_RANGE_DAYS` long (a bit more
+ * than an academic year): the calendar never paints more, and one request cannot make the server walk
+ * a century. Only reading is validated here — writing free days is not an API operation (see app.ts).
+ */
+const MAX_RANGE_DAYS = 400;
+const daysBetween = (from: string, to: string) => (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000;
+export const nonWorkingRangeSchema = z.object({ from: catalogDateSchema, to: catalogDateSchema })
+  .refine((value) => value.to >= value.from, { message: "Intervalul se termină înainte să înceapă", path: ["to"] })
+  .refine((value) => daysBetween(value.from, value.to) <= MAX_RANGE_DAYS, { message: `Intervalul poate acoperi cel mult ${MAX_RANGE_DAYS} de zile`, path: ["to"] });

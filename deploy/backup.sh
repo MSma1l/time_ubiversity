@@ -11,7 +11,9 @@
 # Restore:
 #   PostgreSQL: docker compose exec -T postgres pg_restore -U orar -d orar --clean --if-exists < backups/<ts>/postgres.dump
 #   SQLite:     docker compose stop api
-#               docker compose run --rm --no-deps -T --user root -v "$PWD/backups/<ts>:/restore:ro" --entrypoint sh api \
+#               (--cap-add CHOWN: the api service drops all capabilities)
+#               docker compose run --rm --no-deps -T --user root --cap-add CHOWN \
+#                 -v "$PWD/backups/<ts>:/restore:ro" --entrypoint sh api \
 #                 -c 'gunzip -c /restore/orar.sqlite.gz > /data/orar.sqlite && rm -f /data/orar.sqlite-wal /data/orar.sqlite-shm && chown node:node /data/orar.sqlite'
 #               docker compose start api
 set -euo pipefail
@@ -52,7 +54,9 @@ target="${BACKUP_DIR%/}/${timestamp}"
 mkdir -p "$target"
 
 completed=0
-tmp_in_container="/tmp/orar-backup-${timestamp}.sqlite"
+# Written inside the /data volume, not /tmp: /tmp in the api container is a tmpfs
+# (see docker-compose.yml) and `docker compose cp` cannot read from a tmpfs mount.
+tmp_in_container="/data/.backup-${timestamp}.sqlite"
 cleanup() {
   if [[ "$completed" -ne 1 ]]; then
     log "Backup failed, removing incomplete $target"

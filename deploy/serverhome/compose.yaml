@@ -4,9 +4,9 @@
 # no `deploy.resources` (mem_limit instead), no `ports:`. The images are built beforehand
 # from src/ with deploy/serverhome/build.sh (classic builder).
 #
-# One `.env` next to this file (chmod 600) feeds both the variable interpolation below and the
-# API's environment (env_file). Only the web container joins `shared-network` (nginx_proxy
-# reaches it as time-university-web:80); api and db stay on the project's `internal` network.
+# One `.env` next to this file (chmod 600) feeds the variable interpolation below; the API gets only
+# the variables listed explicitly under its `environment:` (no env_file). Only the web container joins
+# `shared-network` (nginx_proxy reaches it as time-university-web:80); api and db stay on `internal`.
 #
 #   cd /srv/apps/time-university && docker-compose up -d
 
@@ -61,15 +61,33 @@ services:
     tmpfs:
       - /tmp:size=32m,mode=1777
     mem_limit: 512m
-    env_file:
-      - .env
-    # Overrides .env: container paths and internal hosts.
+    # No `env_file: .env`: that would push the whole file into the container, including
+    # POSTGRES_PASSWORD/POSTGRES_USER/POSTGRES_DB and BACKUP_RETENTION_DAYS, which the API never
+    # reads (DATABASE_URL below is already complete) and which `docker inspect` would expose.
+    # The list below is every variable the API actually reads (backend/src/config.ts); values
+    # still come from the same .env, through compose interpolation. A new app variable must be
+    # added BOTH to .env.example and here, otherwise it never reaches the container.
+    # Values go through compose interpolation, so a literal `$` in .env must be written `$$`.
     environment:
       NODE_ENV: 'production'
       PORT: '3001'
       HOST: '0.0.0.0'
       DATABASE_PATH: '/data/orar.sqlite'
       DATABASE_URL: 'postgresql://${POSTGRES_USER:-orar}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-orar}'
+      TELEGRAM_BOT_TOKEN: '${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}'
+      MINI_APP_URL: '${MINI_APP_URL:-}'
+      TELEGRAM_POLLING: '${TELEGRAM_POLLING:-true}'
+      WEBHOOK_URL: '${WEBHOOK_URL:-}'
+      TELEGRAM_WEBHOOK_SECRET: '${TELEGRAM_WEBHOOK_SECRET:-}'
+      INIT_DATA_MAX_AGE_SECONDS: '${INIT_DATA_MAX_AGE_SECONDS:-3600}'
+      ALLOWED_ORIGINS: '${ALLOWED_ORIGINS:-}'
+      TRUST_PROXY: '${TRUST_PROXY:-loopback, linklocal, uniquelocal}'
+      RATE_LIMIT_PER_MINUTE: '${RATE_LIMIT_PER_MINUTE:-120}'
+      ALLOW_DEV_AUTH: '${ALLOW_DEV_AUTH:-false}'
+      # Teaching periods, START:even|odd[:END] comma separated. Empty keeps the built-in default
+      # (one open-ended semester from 2026-09-07, even). A comma is safe here: compose does not
+      # split the value. See backend/src/schedule.ts for the validation rules.
+      SEMESTERS: '${SEMESTERS:-}'
     # ./data/sqlite must be owned by uid 1000 (deea) — deploy.sh creates it.
     volumes:
       - ./data/sqlite:/data
@@ -90,7 +108,9 @@ services:
   # initialised. No cap_drop: the entrypoint chowns the bind mount to uid 70 and drops to it.
   db:
     <<: *hardened
-    image: postgres:16-alpine
+    # Pinned to the multi-arch manifest digest; the tag is kept for readability only.
+    # Refresh procedure: docs/DEPLOY.md, section 9.1.
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     container_name: time-university-db
     mem_limit: 512m
     environment:

@@ -2,9 +2,21 @@ import type { Lesson, WeekType } from './types'
 
 /** All schedule logic follows the university's local time, independent of the device time zone. */
 export const UNIVERSITY_TIME_ZONE = 'Europe/Chisinau'
-/** Academic calendar baseline: the week of 7–13 September 2026 is an even week. */
-const REFERENCE_MONDAY = '2026-09-07'
 const DAY_MS = 86_400_000
+
+/**
+ * A teaching period: `start` is its first Monday, `kind` that week's parity and `end` its last day
+ * (`null` = open-ended). Parity and week numbering restart at every semester — mirrors `Semester`
+ * in backend/src/schedule.ts.
+ */
+export type Semester = { start: string, kind: WeekType, end: string | null }
+
+/**
+ * Identical to `DEFAULT_SEMESTERS` in backend/src/schedule.ts: one open-ended semester anchored on the
+ * even week of 7–13 September 2026. Demo mode and the moments before `GET /api/week` answers run on it,
+ * so it has to match the server's own default exactly.
+ */
+export const DEFAULT_SEMESTERS: readonly Semester[] = [{ start: '2026-09-07', kind: 'even', end: null }]
 
 export const weekdayNames = ['Luni', 'Marți', 'Miercuri', 'Joi', 'Vineri', 'Sâmbătă', 'Duminică']
 /** Calendar grid columns (Monday–Saturday); Sunday is added only when it has lessons. Day tabs and the editor use all of `weekdayNames`. */
@@ -86,11 +98,61 @@ export function dayOfMonth(isoDate: string) {
   return Number(isoDate.slice(8, 10))
 }
 
-/** Week parity for a `YYYY-MM-DD` date (weeks start on Monday). Mirrors backend/src/schedule.ts. */
-export function weekTypeFor(isoDate: string): WeekType {
-  const mondayOf = (value: string) => noonUtc(value).getTime() - weekdayIndexOf(value) * DAY_MS
-  const weeks = Math.round((mondayOf(isoDate) - mondayOf(REFERENCE_MONDAY)) / (7 * DAY_MS))
-  return Math.abs(weeks) % 2 === 0 ? 'even' : 'odd'
+/** Strict `YYYY-MM-DD` check that also rejects impossible dates such as 2026-02-30. Mirrors the backend. */
+export function isValidIsoDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  const date = new Date(`${value}T00:00:00Z`)
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
+}
+
+/** Semesters in force. Module state (not a prop) because parity is needed everywhere; see `installSemesters`. */
+let semesters: Semester[] = [...DEFAULT_SEMESTERS]
+
+/** The calendar the app is currently computing with — the default until `GET /api/week` answers. */
+export const activeSemesters = (): Semester[] => semesters
+
+/**
+ * Installs the calendar received from the server and returns what was applied. An empty or unusable list
+ * keeps the default, so a broken response can never leave the app without a parity. Callers must also put
+ * the result in React state: parity is read during render and nothing else would trigger a re-render.
+ */
+export function installSemesters(list: readonly Semester[] | null | undefined): Semester[] {
+  const valid = (list ?? [])
+    .filter((item): item is Semester => Boolean(item) && isValidIsoDate(item.start) && (item.kind === 'even' || item.kind === 'odd') && (item.end === null || isValidIsoDate(item.end)))
+    .map((item) => ({ start: item.start, kind: item.kind, end: item.end ?? null }))
+    .sort((a, b) => a.start.localeCompare(b.start))
+  semesters = valid.length ? valid : [...DEFAULT_SEMESTERS]
+  return semesters
+}
+
+const otherWeekType = (kind: WeekType): WeekType => kind === 'even' ? 'odd' : 'even'
+const mondayTime = (isoDate: string) => noonUtc(isoDate).getTime() - weekdayIndexOf(isoDate) * DAY_MS
+
+/**
+ * Outside every semester the week number and parity stay defined — the calendar must show something
+ * during the winter break — by extending the last semester that has already started (or the first one,
+ * for dates before the academic year begins). Mirrors `anchorOf` in backend/src/schedule.ts.
+ */
+export function semesterAnchorOf(isoDate: string, list: Semester[] = semesters): Semester {
+  const started = list.filter((semester) => semester.start <= isoDate)
+  return started.length ? started[started.length - 1] : list[0]
+}
+
+/** Week 1 is the semester's first week; weeks before its start are 0, -1, … (backend `universityWeekNumber`). */
+export function universityWeekNumber(isoDate: string, list: Semester[] = semesters): number {
+  return Math.round((mondayTime(isoDate) - mondayTime(semesterAnchorOf(isoDate, list).start)) / (7 * DAY_MS)) + 1
+}
+
+/** Week parity for a `YYYY-MM-DD` date (weeks start on Monday). Mirrors `universityWeekKind` in the backend. */
+export function weekTypeFor(isoDate: string, list: Semester[] = semesters): WeekType {
+  const anchor = semesterAnchorOf(isoDate, list)
+  // Odd week numbers (1, 3, …) share the parity of the semester's first week.
+  return Math.abs(universityWeekNumber(isoDate, list)) % 2 === 1 ? anchor.kind : otherWeekType(anchor.kind)
+}
+
+/** False during the summer holiday and between semesters: no lesson is held, so no reminder is due. */
+export function isStudyDay(isoDate: string, list: Semester[] = semesters): boolean {
+  return list.some((semester) => isoDate >= semester.start && (semester.end === null || isoDate <= semester.end))
 }
 
 export function lessonMatchesWeek(lesson: Lesson, week: WeekType) {

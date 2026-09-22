@@ -1,6 +1,14 @@
 # Orar Univer — host HTTPS reverse proxy (Caddy obtains/renews Let's Encrypt certs).
 #
-# Install on Ubuntu:  sudo apt install -y caddy
+# Install on Debian/Ubuntu. Caddy is NOT in the Ubuntu repositories (`sudo apt install caddy`
+# fails with "Unable to locate package caddy"); these are the official steps (Cloudsmith repo):
+#   sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+#   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+#     | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+#   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+#     | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+#   sudo apt update && sudo apt install -y caddy
+#
 # Use:                sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
 #                     (replace orar.example.md with your domain; keep 8083 = WEB_PORT)
 #                     sudo systemctl reload caddy
@@ -12,6 +20,12 @@ orar.example.md {
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		-Server
+	}
+
+	# Reject oversized bodies at the edge: otherwise Caddy buffers them in full and only the
+	# nginx behind it answers 413 (client_max_body_size 1m). The API takes JSON only.
+	request_body {
+		max_size 1MB
 	}
 
 	reverse_proxy 127.0.0.1:8083 {

@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { lessonRows, openDatabase } from "./db.js";
+import { isoDateInChisinau } from "./schedule.js";
+import { lessonRows, nonWorkingDays, nonWorkingDaysBetween, openDatabase, removeNonWorkingDay, seedLegalHolidays, setNonWorkingDay } from "./db.js";
 
 const dirs: string[] = [];
 function tempDatabasePath() {
@@ -72,6 +73,35 @@ describe("openDatabase migrations", () => {
       { id: 3, role: "teacher", s: 0, t: 1, r: 1 },
       { id: 4, role: "teacher", s: 0, t: 1, r: 1 }
     ]);
+    db.close();
+  });
+});
+
+describe("non-working days", () => {
+  it("seeds a year once and keeps administrator edits", () => {
+    const db = openDatabase(":memory:");
+    // The current and the next year are seeded when the database is opened.
+    const year = isoDateInChisinau().slice(0, 4);
+    expect(nonWorkingDaysBetween(db, `${year}-01-01`, `${year}-12-31`).length).toBeGreaterThan(0);
+    expect(seedLegalHolidays(db, 2029)).toBe(13);
+    expect(nonWorkingDaysBetween(db, "2029-01-01", "2029-12-31").map((day) => day.date)).toEqual([
+      "2029-01-01", "2029-01-07", "2029-01-08", "2029-03-08", "2029-04-09", "2029-04-10", "2029-04-16",
+      "2029-05-01", "2029-05-09", "2029-06-01", "2029-08-27", "2029-08-31", "2029-12-25"
+    ]);
+    // Re-seeding does nothing, so a day removed on purpose (a moved holiday) stays removed.
+    expect(removeNonWorkingDay(db, "2029-05-09")).toBe(true);
+    expect(seedLegalHolidays(db, 2029)).toBe(0);
+    expect(nonWorkingDays(db, ["2029-05-09"]).size).toBe(0);
+    db.close();
+  });
+
+  it("stores days added by hand and reads several dates at once", () => {
+    const db = openDatabase(":memory:");
+    setNonWorkingDay(db, "2026-10-20", "Zi de reabilitare");
+    setNonWorkingDay(db, "2026-10-20", "Vacanță de toamnă");
+    expect(nonWorkingDays(db, ["2026-10-19", "2026-10-20", "2026-10-21"])).toEqual(new Map([["2026-10-20", "Vacanță de toamnă"]]));
+    expect(nonWorkingDays(db, [])).toEqual(new Map());
+    expect(removeNonWorkingDay(db, "2026-10-21")).toBe(false);
     db.close();
   });
 });
