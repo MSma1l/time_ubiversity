@@ -231,11 +231,21 @@ export const saveLabGrade = (studentId: string, laboratory: string, grade: numbe
 
 export type LabGrade = { id: string, student_id: string, laboratory: string, presented_on: string | null, grade: number, feedback: string | null, created_at: string }
 export type SavedAttendance = { date: string, sessionId: string | null, topic: string | null, entries: Array<{ studentId: string, status: AttendanceStatus }> }
+export type Laboratory = { id: string, groupId: string, number: number, label: string, createdAt: string }
+export type GroupStatistics = {
+  group: { id: string, name: string }, studentCount: number
+  attendance: { sessionCount: number, recordedCount: number, presentCount: number, absentCount: number, lateCount: number, unmarkedCount: number, sessions: Array<{ date: string, topic: string | null, recorded: number, present: number, absent: number, late: number, unmarked: number }> }
+  grades: { gradedCount: number, average: number | null, laboratories: Array<{ id: string, number: number, label: string, gradedCount: number, missingCount: number, average: number | null, min: number | null, max: number | null }> }
+  students: Array<{ id: string, firstName: string, lastName: string, present: number, absent: number, late: number, attendanceEvents: Array<{ date: string, status: 'absent' | 'late', topic: string | null }>, gradedCount: number, average: number | null, grades: Array<{ id: string, laboratory: string, grade: number, presentedOn: string | null }> }>
+}
 
 /** Saved attendance of one day (default: today in the university time zone). */
 export const loadAttendance = (groupId: string, date = universityClock().isoDate) =>
   request<SavedAttendance>(`/api/teacher/groups/${encodeURIComponent(groupId)}/attendance?date=${encodeURIComponent(date)}`)
 export const loadLabGrades = (studentId: string) => request<LabGrade[]>(`/api/teacher/students/${encodeURIComponent(studentId)}/grades`)
+export const loadLaboratories = (groupId: string) => request<Laboratory[]>(`/api/teacher/groups/${encodeURIComponent(groupId)}/laboratories`)
+export const createLaboratory = (groupId: string) => request<Laboratory>(`/api/teacher/groups/${encodeURIComponent(groupId)}/laboratories`, { method: 'POST', body: JSON.stringify({}) })
+export const loadGroupStatistics = (groupId: string) => request<GroupStatistics>(`/api/teacher/groups/${encodeURIComponent(groupId)}/statistics`)
 export const renameTeacherGroup = async (groupId: string, name: string) =>
   fromApiGroup(await request<ApiTeacherGroup>(`/api/teacher/groups/${encodeURIComponent(groupId)}`, { method: 'PATCH', body: JSON.stringify({ name: name.trim() }) }))
 export const deleteTeacherGroup = (groupId: string) => request<void>(`/api/teacher/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' })

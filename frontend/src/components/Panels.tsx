@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useDialog } from '../dialogs'
 import { addDays, formatServerDate, formatWeekRange, lessonMatchesWeek, lessonTiming, teachingDays, timeToMinutes, weekdayNames, weekTypeFor, weekTypeLabels, type UniversityClock } from '../schedule'
-import { initialOf, roleLabels, timingText } from '../labels'
+import { roleLabels, timingText } from '../labels'
+import profileAvatar from '../assets/profile-avatar.svg'
 import { CheckIcon } from './LessonCard'
 import type { AppNotification, Lesson, Role, WeekType } from '../types'
 
@@ -25,7 +26,7 @@ export function NotificationPanel({ items, error, onClose }: { items: AppNotific
   </div>
 }
 
-const timeSlots = ['08:00', '09:45', '11:30', '13:30', '15:15', '17:00', '18:45']
+const timeSlots = ['08:00', '09:45', '11:30', '13:30', '15:15', '17:30', '19:10']
 const slotMinutes = timeSlots.map(timeToMinutes)
 /** A lesson belongs to the last slot that starts at or before it, so custom start times still appear in the grid. */
 const slotIndexFor = (time: string) => {
@@ -66,8 +67,19 @@ export function CalendarPanel({ lessons, role, clock, weekStart, weekOffset, onS
   const [showAll, setShowAll] = useState(false)
   const week = weekTypeFor(weekStart)
   const roleLessons = lessons.filter((lesson) => lesson.role === role)
-  const visible = showAll ? roleLessons : roleLessons.filter((lesson) => lessonMatchesWeek(lesson, week))
-  const hiddenCount = roleLessons.length - roleLessons.filter((lesson) => lessonMatchesWeek(lesson, week)).length
+  /** When odd and even lessons share a slot, both stay visible as the cell's top/bottom halves. */
+  const splitSlots = new Map<string, Set<WeekType>>()
+  for (const lesson of roleLessons) {
+    if (lesson.weekType === 'both') continue
+    const key = `${lesson.weekday}-${slotIndexFor(lesson.startTime)}`
+    const kinds = splitSlots.get(key) ?? new Set<WeekType>(); kinds.add(lesson.weekType); splitSlots.set(key, kinds)
+  }
+  const isSplitSlot = (lesson: Lesson) => {
+    const kinds = splitSlots.get(`${lesson.weekday}-${slotIndexFor(lesson.startTime)}`)
+    return kinds?.has('even') && kinds.has('odd')
+  }
+  const visible = showAll ? roleLessons : roleLessons.filter((lesson) => lessonMatchesWeek(lesson, week) || isSplitSlot(lesson))
+  const hiddenCount = roleLessons.length - visible.length
   // Sunday gets a column only when it actually has visible lessons.
   const hasSunday = visible.some((lesson) => lesson.weekday === weekdayNames.length - 1)
   const days = hasSunday ? weekdayNames : teachingDays
@@ -102,14 +114,17 @@ export function CalendarPanel({ lessons, role, clock, weekStart, weekOffset, onS
           ...days.map((dayName, day) => {
             const items = cells.get(`${day}-${slot}`) ?? []
             if (!items.length) return <button type="button" className="calendar-cell" key={`${day}-${time}`} onClick={() => onAdd(day, time)} aria-label={`Adaugă o oră ${dayName} la ${time}`}><span aria-hidden="true">+</span></button>
-            return <div className="calendar-cell occupied" key={`${day}-${time}`}>
+            // A parity-specific class always reserves its own half: odd above, even below.
+            // This keeps its position stable even when the counterpart is not shown this week.
+            const parityLayout = items.some((item) => item.weekType !== 'both')
+            return <div className={`calendar-cell occupied${parityLayout ? ' parity-layout' : ''}`} key={`${day}-${time}`}>
               {items.map((item) => {
                 const inWeek = lessonMatchesWeek(item, week)
                 // Only lessons that take place in the displayed week have a time state.
                 const timing = inWeek ? lessonTiming(item, addDays(weekStart, day), clock) : undefined
                 const state = timing?.state === 'past' || timing?.state === 'current' ? timing.state : ''
                 const spoken = state ? `, ${timingText(timing)?.spoken}` : ''
-                return <button type="button" key={item.id} className={['calendar-lesson', inWeek ? '' : 'other-week', state].filter(Boolean).join(' ')} onClick={() => onEdit(item)}
+                return <button type="button" key={item.id} className={['calendar-lesson', item.weekType === 'odd' ? 'odd-slot' : item.weekType === 'even' ? 'even-slot' : '', inWeek ? '' : 'other-week', state].filter(Boolean).join(' ')} onClick={() => onEdit(item)}
                   aria-label={`Editează ${item.title}, ${dayName} ${item.startTime}, ${shortWeek[item.weekType]}${inWeek ? '' : ' (nu în această săptămână)'}${spoken}`}>
                   {state === 'past' && <CheckIcon />}{state === 'current' && <i className="live-dot" aria-hidden="true" />}
                   <b>{item.title}</b><small>{item.startTime !== time ? `${item.startTime} · ` : ''}{item.room}</small><em>{shortWeek[item.weekType]}</em>
@@ -140,7 +155,7 @@ export function ProfilePanel({ name, role, week, enabled, synced, error, busy = 
         <div><p>ORAR UNIVER · TELEGRAM</p><h2 id="profile-title">Profilul meu</h2></div>
         <button type="button" onClick={onClose} aria-label="Închide">×</button>
       </div>
-      <div className="profile-hero"><span aria-hidden="true">{initialOf(name)}</span><div><h3>{name || 'Utilizator'}</h3><p>{synced ? 'Conectat automat prin Telegram' : 'Neconectat — datele nu se sincronizează'}</p></div></div>
+      <div className="profile-hero"><span className="profile-avatar-image" aria-hidden="true"><img src={profileAvatar} alt="" /></span><div><h3>{name || 'Utilizator'}</h3><p>{synced ? 'Conectat automat prin Telegram' : 'Neconectat — datele nu se sincronizează'}</p></div></div>
       {error && <p className="error-notice profile-error" role="alert">⚠ {error}</p>}
       <div className="profile-setting"><div><strong>Rol activ</strong><p>{roleLabels[role]}</p></div><button type="button" onClick={onSwitchRole} disabled={busy} aria-busy={busy}>{busy ? 'Se salvează…' : 'Schimbă rolul'}</button></div>
       {(['student', 'teacher'] as const).map((kind) => <div className="profile-setting" key={kind}>

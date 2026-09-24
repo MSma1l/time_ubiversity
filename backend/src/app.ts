@@ -12,7 +12,7 @@ import { ProfileRuleError, readProfile, updateProfile, type Profile } from "./pr
 import { createRateLimiter, rateLimitMiddleware } from "./rateLimit.js";
 import { addDays, isoDateInChisinau, isoWeekday, isValidIsoDate, SEMESTER_REFERENCE_KIND, SEMESTER_REFERENCE_MONDAY, weekInfo } from "./schedule.js";
 import { safeEqual, validateInitData, type TelegramUser } from "./telegram.js";
-import { attendanceQuerySchema, attendanceSchema, gradeSchema, groupPatchSchema, groupSchema, lessonIdSchema, lessonSchema, lessonUpdateSchema, nonWorkingRangeSchema, notificationsReadSchema, profilePatchSchema, studentPatchSchema, studentSchema, uuidSchema } from "./validation.js";
+import { attendanceQuerySchema, attendanceSchema, gradeSchema, groupPatchSchema, groupSchema, laboratorySchema, lessonIdSchema, lessonSchema, lessonUpdateSchema, nonWorkingRangeSchema, notificationsReadSchema, profilePatchSchema, studentPatchSchema, studentSchema, uuidSchema } from "./validation.js";
 
 export const LIMITS = { lessonsPerUser: 500, groupsPerTeacher: 200, studentsPerGroup: 500 };
 
@@ -268,6 +268,7 @@ export function createApp({ db, config, log = console }: AppDependencies) {
   };
   const GROUP_COLUMNS = "g.id, g.owner_id, g.name, g.subject, g.created_at, (SELECT COUNT(*)::int FROM students s WHERE s.group_id=g.id) AS student_count";
   const GRADE_COLUMNS = "id, student_id, laboratory, presented_on::text AS presented_on, grade::float8 AS grade, feedback, created_at";
+  const LABORATORY_COLUMNS = 'id, group_id AS "groupId", number, label, created_at AS "createdAt"';
 
   /**
    * Groups linked to the Profesor schedule: `linkedLessons` / `subjects` come from the owner's teacher lessons
@@ -360,6 +361,26 @@ export function createApp({ db, config, log = console }: AppDependencies) {
     });
     res.status(201).json(created);
   });
+  /** Persistent group-level laboratories. The group lock makes the next number race-safe. */
+  app.get("/api/teacher/groups/:groupId/laboratories", auth, async (req, res) => {
+    const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND);
+    const pg = await catalog(res); if (!pg) return;
+    if (!await ownedGroup(pg, groupId, userOf(req).id)) return res.status(404).json({ error: GROUP_NOT_FOUND });
+    const result = await pg.query(`SELECT ${LABORATORY_COLUMNS} FROM laboratories WHERE group_id=$1 ORDER BY number`, [groupId]);
+    res.json(result.rows);
+  });
+  app.post("/api/teacher/groups/:groupId/laboratories", auth, async (req, res) => {
+    const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND); laboratorySchema.parse(req.body ?? {});
+    const pg = await catalog(res); if (!pg) return;
+    const laboratory = await inTransaction(pg, async (client) => {
+      await lockCatalogGroup(client, groupId);
+      if (!(await client.query("SELECT id FROM academic_groups WHERE id=$1 AND owner_id=$2", [groupId, userOf(req).id])).rowCount) throw new HttpError(404, GROUP_NOT_FOUND);
+      const next = (await client.query("SELECT COALESCE(MAX(number),0)::int + 1 AS number FROM laboratories WHERE group_id=$1", [groupId])).rows[0].number as number;
+      return (await client.query(`INSERT INTO laboratories(group_id,number,label) VALUES($1,$2,$3) RETURNING ${LABORATORY_COLUMNS}`,
+        [groupId, next, `Laborator ${next}`])).rows[0];
+    });
+    res.status(201).json(laboratory);
+  });
   const OWNED_STUDENT = "SELECT s.id FROM students s JOIN academic_groups g ON g.id=s.group_id WHERE s.id=$1 AND g.owner_id=$2";
   app.patch("/api/teacher/students/:studentId", auth, async (req, res) => {
     const studentId = parseUuid(req.params.studentId, STUDENT_NOT_FOUND); const input = studentPatchSchema.parse(req.body);
@@ -416,6 +437,39 @@ export function createApp({ db, config, log = console }: AppDependencies) {
       client.release();
     }
     res.status(204).end();
+  });
+  /** Group review. Missing marks and grades are intentionally separate from absences and zeroes. */
+  app.get("/api/teacher/groups/:groupId/statistics", auth, async (req, res) => {
+    const groupId = parseUuid(req.params.groupId, GROUP_NOT_FOUND);
+    const pg = await catalog(res); if (!pg) return;
+    const group = await pg.query("SELECT id,name FROM academic_groups WHERE id=$1 AND owner_id=$2", [groupId, userOf(req).id]);
+    if (!group.rowCount) return res.status(404).json({ error: GROUP_NOT_FOUND });
+    const studentCount = (await pg.query("SELECT COUNT(*)::int AS count FROM students WHERE group_id=$1", [groupId])).rows[0].count as number;
+    const attendanceRows = await pg.query(`SELECT a.occurred_on::text AS date, a.topic, COUNT(e.student_id)::int AS recorded,
+      COUNT(e.student_id) FILTER (WHERE e.status='present')::int AS present, COUNT(e.student_id) FILTER (WHERE e.status='absent')::int AS absent,
+      COUNT(e.student_id) FILTER (WHERE e.status='late')::int AS late FROM attendance_sessions a LEFT JOIN attendance_entries e ON e.session_id=a.id
+      WHERE a.group_id=$1 GROUP BY a.id,a.occurred_on,a.topic ORDER BY a.occurred_on DESC`, [groupId]);
+    const sessions = attendanceRows.rows.map((row) => ({ ...row, unmarked: Math.max(0, studentCount - Number(row.recorded)) }));
+    const attendance = sessions.reduce((total, row) => ({ sessionCount: total.sessionCount + 1, recordedCount: total.recordedCount + Number(row.recorded), presentCount: total.presentCount + Number(row.present), absentCount: total.absentCount + Number(row.absent), lateCount: total.lateCount + Number(row.late), unmarkedCount: total.unmarkedCount + row.unmarked }), { sessionCount: 0, recordedCount: 0, presentCount: 0, absentCount: 0, lateCount: 0, unmarkedCount: 0 });
+    const laboratoryRows = await pg.query(`SELECT l.id,l.number,l.label,COUNT(lg.id)::int AS "gradedCount",AVG(lg.grade)::float8 AS average,MIN(lg.grade)::float8 AS min,MAX(lg.grade)::float8 AS max
+      FROM laboratories l LEFT JOIN students s ON s.group_id=l.group_id LEFT JOIN lab_grades lg ON lg.student_id=s.id AND lg.laboratory=l.label
+      WHERE l.group_id=$1 GROUP BY l.id,l.number,l.label ORDER BY l.number`, [groupId]);
+    const laboratories = laboratoryRows.rows.map((row) => ({ ...row, missingCount: Math.max(0, studentCount - Number(row.gradedCount)) }));
+    const overall = (await pg.query("SELECT COUNT(lg.id)::int AS \"gradedCount\",AVG(lg.grade)::float8 AS average FROM lab_grades lg JOIN students s ON s.id=lg.student_id WHERE s.group_id=$1", [groupId])).rows[0];
+    const students = (await pg.query(`SELECT s.id,s.first_name AS "firstName",s.last_name AS "lastName",COALESCE(a.present,0)::int AS present,COALESCE(a.absent,0)::int AS absent,COALESCE(a.late,0)::int AS late,COALESCE(g."gradedCount",0)::int AS "gradedCount",g.average::float8 AS average FROM students s
+      LEFT JOIN (SELECT e.student_id,COUNT(*) FILTER (WHERE e.status='present')::int AS present,COUNT(*) FILTER (WHERE e.status='absent')::int AS absent,COUNT(*) FILTER (WHERE e.status='late')::int AS late FROM attendance_entries e JOIN attendance_sessions a ON a.id=e.session_id WHERE a.group_id=$1 GROUP BY e.student_id) a ON a.student_id=s.id
+      LEFT JOIN (SELECT lg.student_id,COUNT(*)::int AS "gradedCount",AVG(lg.grade)::float8 AS average FROM lab_grades lg JOIN students si ON si.id=lg.student_id WHERE si.group_id=$1 GROUP BY lg.student_id) g ON g.student_id=s.id
+      WHERE s.group_id=$1 ORDER BY s.last_name,s.first_name`, [groupId])).rows;
+    const attendanceDetails = await pg.query(`SELECT e.student_id AS "studentId",e.status,a.occurred_on::text AS date,a.topic
+      FROM attendance_entries e JOIN attendance_sessions a ON a.id=e.session_id
+      WHERE a.group_id=$1 AND e.status IN ('absent','late') ORDER BY e.student_id,a.occurred_on DESC`, [groupId]);
+    const gradeDetails = await pg.query(`SELECT lg.id,lg.student_id AS "studentId",lg.laboratory,lg.grade::float8 AS grade,lg.presented_on::text AS "presentedOn"
+      FROM lab_grades lg JOIN students s ON s.id=lg.student_id LEFT JOIN laboratories l ON l.group_id=s.group_id AND l.label=lg.laboratory
+      WHERE s.group_id=$1 ORDER BY lg.student_id,l.number NULLS LAST,lg.laboratory`, [groupId]);
+    const detailsByStudent = new Map<string, { attendanceEvents: unknown[], grades: unknown[] }>(students.map((student) => [student.id as string, { attendanceEvents: [], grades: [] }]));
+    for (const row of attendanceDetails.rows) detailsByStudent.get(row.studentId as string)?.attendanceEvents.push(row);
+    for (const row of gradeDetails.rows) detailsByStudent.get(row.studentId as string)?.grades.push(row);
+    res.json({ group: group.rows[0], studentCount, attendance: { ...attendance, sessions }, grades: { ...overall, laboratories }, students: students.map((student) => ({ ...student, ...(detailsByStudent.get(student.id as string) ?? { attendanceEvents: [], grades: [] }) })) });
   });
   app.get("/api/teacher/students/:studentId/grades", auth, async (req, res) => {
     const studentId = parseUuid(req.params.studentId, STUDENT_NOT_FOUND);

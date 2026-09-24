@@ -4,7 +4,8 @@ import { BellIcon, LessonCard } from './components/LessonCard'
 import { LessonEditor, type EditorFailure } from './components/LessonEditor'
 import { CalendarPanel, NotificationPanel, ProfilePanel, WeekNav } from './components/Panels'
 import { TeacherCatalog } from './components/TeacherCatalog'
-import { initialOf, minutesLabel, roleLabels } from './labels'
+import { minutesLabel, roleLabels } from './labels'
+import profileAvatar from './assets/profile-avatar.svg'
 import { activeSemesters, addDays, byStartTime, currentInstant, dayOfMonth, demoLessons, formatDayMonth, formatWeekRange, installSemesters, isStudyDay, lessonMatchesWeek, lessonTiming, mondayOf, semesterAnchorOf, timeToMinutes, universityClock, weekdayNames, weekTypeFor, weekTypeLabels } from './schedule'
 import { confirmAction, detectSession } from './telegram'
 import type { AccountProfile } from './api'
@@ -472,7 +473,7 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   return <main className="app-shell">
     <header className="topbar">
       <div><p className="eyebrow">ORAR UNIVER</p><h1>{name ? `Bună, ${name}` : 'Bună'} <span aria-hidden="true">👋</span></h1></div>
-      <button type="button" className="avatar" onClick={() => setProfileOpen(true)} aria-label="Deschide profilul">{initialOf(name)}</button>
+      <button type="button" className="avatar" onClick={() => setProfileOpen(true)} aria-label="Deschide profilul"><img src={profileAvatar} alt="" /></button>
     </header>
     {demo && <p className="sync demo-banner" role="note">Mod demonstrativ: date de exemplu, nimic nu se salvează pe server.</p>}
 
@@ -534,7 +535,7 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
       <button type="button" className="nav-add" onClick={() => openNewLesson()} aria-label="Adaugă oră">＋</button>
       <button type="button" className="nav-item footer-notifications" onClick={openNotifications} aria-label={unreadCount ? `Notificări, ${unreadCount} necitite` : 'Notificări'}><BellIcon /><small>Notificări</small>{unreadCount ? <i aria-hidden="true">{unreadCount}</i> : null}</button>
       {role === 'teacher' && <button type="button" className="nav-item" onClick={() => setCatalogOpen(true)}><span aria-hidden="true">▦</span><small>Evidență</small></button>}
-      <button type="button" className="nav-item" onClick={() => setProfileOpen(true)}><span aria-hidden="true">◌</span><small>Profil</small></button>
+      <button type="button" className="nav-item nav-profile" onClick={() => setProfileOpen(true)}><img src={profileAvatar} alt="" aria-hidden="true" /><small>Profil</small></button>
     </footer>
 
     {calendarOpen && <CalendarPanel lessons={lessons} role={role} clock={today} weekStart={weekStart} weekOffset={weekOffset} onShiftWeek={shiftWeek} onResetWeek={() => setWeekOffset(0)}

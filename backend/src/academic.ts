@@ -44,9 +44,11 @@ const SCHEMA_SQL = `CREATE EXTENSION IF NOT EXISTS pgcrypto;
     CREATE TABLE IF NOT EXISTS students (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), group_id UUID NOT NULL REFERENCES academic_groups(id) ON DELETE CASCADE, first_name VARCHAR(80) NOT NULL, last_name VARCHAR(80) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
     CREATE TABLE IF NOT EXISTS attendance_sessions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), group_id UUID NOT NULL REFERENCES academic_groups(id) ON DELETE CASCADE, occurred_on DATE NOT NULL, topic VARCHAR(160), created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(group_id,occurred_on));
     CREATE TABLE IF NOT EXISTS attendance_entries (session_id UUID NOT NULL REFERENCES attendance_sessions(id) ON DELETE CASCADE, student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE, status VARCHAR(12) NOT NULL CHECK(status IN ('present','absent','late')), PRIMARY KEY(session_id,student_id));
+    CREATE TABLE IF NOT EXISTS laboratories (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), group_id UUID NOT NULL REFERENCES academic_groups(id) ON DELETE CASCADE, number INTEGER NOT NULL CHECK(number > 0), label VARCHAR(120) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(group_id,number));
     CREATE TABLE IF NOT EXISTS lab_grades (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE, laboratory VARCHAR(120) NOT NULL, presented_on DATE, grade NUMERIC(4,2) NOT NULL CHECK(grade >= 0 AND grade <= 10), feedback VARCHAR(500), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
     CREATE INDEX IF NOT EXISTS students_group_idx ON students(group_id);
     CREATE INDEX IF NOT EXISTS attendance_entries_student_idx ON attendance_entries(student_id);
+    CREATE INDEX IF NOT EXISTS laboratories_group_idx ON laboratories(group_id,number);
     CREATE INDEX IF NOT EXISTS lab_grades_student_idx ON lab_grades(student_id);`;
 
 type Queryable = Pick<PoolClient, "query">;
@@ -76,6 +78,29 @@ async function migrateGroupNames(client: Queryable) {
   await client.query("CREATE UNIQUE INDEX IF NOT EXISTS academic_groups_owner_lower_name_uidx ON academic_groups(owner_id, lower(name))");
 }
 
+/** Adds persistent group laboratories for historical free-text grade labels without altering the grades. */
+async function migrateLaboratories(client: Queryable) {
+  const existing = await client.query("SELECT group_id, number, label FROM laboratories ORDER BY group_id, number");
+  const labels = new Map<string, Set<string>>();
+  const usedNumbers = new Map<string, Set<number>>();
+  for (const row of existing.rows as Array<{ group_id: string, number: number, label: string }>) {
+    const groupLabels = labels.get(row.group_id) ?? new Set<string>(); groupLabels.add(row.label.trim().toLocaleLowerCase("ro")); labels.set(row.group_id, groupLabels);
+    const numbers = usedNumbers.get(row.group_id) ?? new Set<number>(); numbers.add(Number(row.number)); usedNumbers.set(row.group_id, numbers);
+  }
+  const historical = await client.query("SELECT s.group_id, lg.laboratory FROM lab_grades lg JOIN students s ON s.id=lg.student_id GROUP BY s.group_id, lg.laboratory ORDER BY s.group_id, lg.laboratory");
+  for (const row of historical.rows as Array<{ group_id: string, laboratory: string }>) {
+    const label = row.laboratory.trim(); const labelKey = label.toLocaleLowerCase("ro");
+    if (!label || labels.get(row.group_id)?.has(labelKey)) continue;
+    const numbers = usedNumbers.get(row.group_id) ?? new Set<number>();
+    const matched = /(?:laborator(?:ul)?\\s*)?(\\d+)$/iu.exec(label);
+    let number = matched ? Number(matched[1]) : 0;
+    if (!Number.isInteger(number) || number < 1 || numbers.has(number)) number = Math.max(0, ...numbers) + 1;
+    await client.query("INSERT INTO laboratories(group_id,number,label) VALUES($1,$2,$3)", [row.group_id, number, label]);
+    numbers.add(number); usedNumbers.set(row.group_id, numbers);
+    const groupLabels = labels.get(row.group_id) ?? new Set<string>(); groupLabels.add(labelKey); labels.set(row.group_id, groupLabels);
+  }
+}
+
 async function createSchema(db: Pool) {
   const client = await db.connect();
   try {
@@ -85,6 +110,7 @@ async function createSchema(db: Pool) {
     await client.query(SCHEMA_SQL);
     await migrateLabGrades(client);
     await migrateGroupNames(client);
+    await migrateLaboratories(client);
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);

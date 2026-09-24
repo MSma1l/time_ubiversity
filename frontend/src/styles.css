@@ -54,3 +54,5 @@
 .day-off{display:flex;flex-wrap:wrap;align-items:center;gap:6px 9px;margin:14px 0 0;padding:9px 11px;border-radius:12px;background:#fdf3e2;border:1px solid #f0dcb4;color:#7a6438;font-size:11px;line-height:1.4}
 .day-off b{flex:none;border-radius:20px;padding:4px 9px;background:#e8b83e;color:#182c49;font-size:10px;font-weight:800;letter-spacing:.04em}
 .day-off span{min-width:0;flex:1 1 150px}
+.nav-item.nav-profile{gap:4px}.nav-profile img{width:25px;height:25px;border-radius:8px;box-shadow:0 2px 6px #103d6a35}
+.avatar{padding:0;background:transparent;overflow:hidden}.avatar img{display:block;width:100%;height:100%}.profile-hero>.profile-avatar-image{overflow:hidden;background:transparent}.profile-avatar-image img{display:block;width:100%;height:100%}

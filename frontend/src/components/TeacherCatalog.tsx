@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import {
-  createTeacherGroup, createTeacherStudent, deleteTeacherGroup, deleteTeacherStudent, errorMessage, isSessionExpired, loadAttendance, loadLabGrades, loadTeacherGroups, loadTeacherStudents,
-  renameTeacherGroup, renameTeacherStudent, saveAttendance, saveLabGrade, type AttendanceStatus, type LabGrade, type TeacherGroup, type TeacherStudent,
+  createLaboratory, createTeacherGroup, createTeacherStudent, deleteTeacherGroup, deleteTeacherStudent, errorMessage, isSessionExpired, loadAttendance, loadGroupStatistics, loadLabGrades, loadLaboratories, loadTeacherGroups, loadTeacherStudents,
+  renameTeacherGroup, renameTeacherStudent, saveAttendance, saveLabGrade, type AttendanceStatus, type GroupStatistics, type LabGrade, type Laboratory, type TeacherGroup, type TeacherStudent,
 } from '../api'
 import { useDialog } from '../dialogs'
 import { lessonsLabel } from '../labels'
@@ -35,6 +35,23 @@ function ScheduleLink({ group, className }: { group: TeacherGroup, className: st
   </small>
 }
 const formatGrade = (grade: number) => grade.toLocaleString('ro-RO', { maximumFractionDigits: 2 })
+const formatPercent = (value: number, total: number) => total ? `${Math.round((value / total) * 100)}%` : '—'
+
+function StatisticsPanel({ item, loading, failed, retry }: { item: GroupStatistics | null, loading: boolean, failed: boolean, retry(): void }) {
+  const [expandedStudent, setExpandedStudent] = useState<string | null>(null)
+  if (loading) return <p className="empty-catalog">Se încarcă statisticile…</p>
+  if (failed || !item) return <p className="empty-catalog">Statisticile nu au putut fi încărcate. <button type="button" onClick={retry}>Reîncearcă</button></p>
+  const { attendance, grades } = item
+  return <section className="catalog-statistics" aria-label={`Statistici ${item.group.name}`}>
+    <div className="stat-cards"><p><strong>{item.studentCount}</strong>studenți</p><p><strong>{attendance.sessionCount}</strong>sesiuni</p><p><strong>{formatPercent(attendance.presentCount, attendance.recordedCount)}</strong>prezenți din marcați</p><p><strong>{grades.average === null ? '—' : formatGrade(grades.average)}</strong>media notelor</p></div>
+    <section><h3>Prezență</h3><p>P {attendance.presentCount} · A {attendance.absentCount} · Î {attendance.lateCount} · nemarcat {attendance.unmarkedCount}</p>{attendance.sessions.length ? <ul>{attendance.sessions.map((session) => <li key={session.date}><b>{formatDayMonth(session.date)}</b> — P {session.present}, A {session.absent}, Î {session.late}, nemarcat {session.unmarked}</li>)}</ul> : <p>Nicio sesiune salvată.</p>}</section>
+    <section><h3>Lucrări și note</h3>{grades.laboratories.length ? <ul>{grades.laboratories.map((lab) => <li key={lab.id}><b>{lab.label}</b> — {lab.gradedCount}/{item.studentCount} notați, medie {lab.average === null ? '—' : formatGrade(lab.average)}</li>)}</ul> : <p>Nicio lucrare adăugată.</p>}</section>
+    <section className="statistics-students"><h3>Elevi</h3><div>{item.students.map((student) => {
+      const expanded = expandedStudent === student.id
+      return <article key={student.id} className="statistics-student"><button type="button" className="statistics-student-toggle" onClick={() => setExpandedStudent(expanded ? null : student.id)} aria-expanded={expanded} aria-controls={`student-details-${student.id}`}><span>{student.lastName} {student.firstName}</span><small>P {student.present} · A {student.absent} · Î {student.late} · {student.gradedCount} note · media {student.average === null ? '—' : formatGrade(student.average)}</small></button>{expanded && <div id={`student-details-${student.id}`} className="student-detail"><p><strong>Absențe și întârzieri</strong></p>{student.attendanceEvents.length ? <ul>{student.attendanceEvents.map((event, index) => <li key={`${event.date}-${index}`}>{formatDayMonth(event.date)} — {event.status === 'absent' ? 'Absent' : 'Întârziat'}{event.topic ? ` · ${event.topic}` : ''}</li>)}</ul> : <p>Nicio absență sau întârziere salvată.</p>}<p><strong>Note</strong></p>{student.grades.length ? <ul>{student.grades.map((grade) => <li key={grade.id}><b>{grade.laboratory}</b>: {formatGrade(grade.grade)}{grade.presentedOn ? ` · ${formatDayMonth(grade.presentedOn)}` : ' · dată nespecificată'}</li>)}</ul> : <p>Nicio notă salvată.</p>}</div>}</article>
+    })}</div></section>
+  </section>
+}
 
 /** Keeps a form's submit button visible above the mobile keyboard once the viewport has shrunk. */
 const revealSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -66,7 +83,7 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName, onS
   const [selected, setSelected] = useState('')
   const [studentsState, setStudentsState] = useState<{ groupId: string, items: TeacherStudent[], failed: boolean }>({ groupId: '', items: [], failed: false })
   const [studentsReload, setStudentsReload] = useState(0)
-  const [tab, setTab] = useState<'attendance' | 'grades'>('attendance')
+  const [tab, setTab] = useState<'attendance' | 'grades' | 'statistics'>('attendance')
   const [message, setMessage] = useState(available ? '' : 'Catalogul este disponibil doar când aplicația este deschisă din Telegram.')
   const [busy, setBusy] = useState(false)
   const [showStudentForm, setShowStudentForm] = useState(false)
@@ -79,7 +96,9 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName, onS
   const [studentDraft, setStudentDraft] = useState<StudentDraft | null>(null)
   const [attendance, setAttendance] = useState<{ groupId: string, marks: Record<string, AttendanceStatus>, failed: boolean }>({ groupId: '', marks: {}, failed: false })
   const [attendanceReload, setAttendanceReload] = useState(0)
-  const [laboratory, setLaboratory] = useState('Laborator')
+  const [laboratory, setLaboratory] = useState('')
+  const [laboratories, setLaboratories] = useState<{ groupId: string, items: Laboratory[], loading: boolean, failed: boolean }>({ groupId: '', items: [], loading: false, failed: false })
+  const [statistics, setStatistics] = useState<{ groupId: string, item: GroupStatistics | null, loading: boolean, failed: boolean }>({ groupId: '', item: null, loading: false, failed: false })
   const [grades, setGrades] = useState<GradesState | null>(null)
   const [gradeValue, setGradeValue] = useState('')
   /** Group still to be selected after the groups load, and whether the list was already re-fetched for it. */
@@ -165,17 +184,47 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName, onS
     return () => { active = false }
   }, [available, isSettings, tab, selected, today, attendanceReload])
 
+  useEffect(() => {
+    if (!available || isSettings || tab !== 'grades' || !selected) return
+    let active = true
+    loadLaboratories(selected).then((items) => {
+      if (!active) return
+      setLaboratories({ groupId: selected, items, loading: false, failed: false })
+      setLaboratory((current) => items.some((item) => item.label === current) ? current : items[0]?.label ?? '')
+    }).catch((error) => {
+      if (!active) return
+      setLaboratories({ groupId: selected, items: [], loading: false, failed: true })
+      setMessage(errorMessage(error, 'Lucrările nu au putut fi încărcate.'))
+    })
+    return () => { active = false }
+  }, [available, isSettings, tab, selected])
+
+  useEffect(() => {
+    if (!available || isSettings || tab !== 'statistics' || !selected) return
+    let active = true
+    loadGroupStatistics(selected).then((item) => {
+      if (active) setStatistics({ groupId: selected, item, loading: false, failed: false })
+    }).catch((error) => {
+      if (!active) return
+      setStatistics({ groupId: selected, item: null, loading: false, failed: true })
+      setMessage(errorMessage(error, 'Statisticile nu au putut fi încărcate.'))
+    })
+    return () => { active = false }
+  }, [available, isSettings, tab, selected])
+
   const studentsReady = Boolean(selected) && studentsState.groupId === selected
   const students = studentsReady ? studentsState.items : []
   const selectedGroup = groups.find((item) => item.id === selected)
   const attendanceReady = attendance.groupId === selected && !attendance.failed
+  const laboratoriesLoading = laboratories.groupId !== selected || laboratories.loading
+  const statisticsLoading = statistics.groupId !== selected || statistics.loading
 
   const reloadGroups = () => { setGroupsLoading(true); setMessage(''); setGroupsReload((value) => value + 1) }
   const reloadStudents = () => { setStudentsState({ groupId: '', items: [], failed: false }); setMessage(''); setStudentsReload((value) => value + 1) }
   const reloadAttendance = () => { setAttendance({ groupId: '', marks: {}, failed: false }); setMessage(''); setAttendanceReload((value) => value + 1) }
   /** Everything tied to the previous group is dropped, so a half-filled student form can never be submitted into another group. */
   const selectGroup = (groupId: string) => {
-    setSelected(groupId); setGrades(null); setStudentDraft(null); setGroupDraft(null)
+    setSelected(groupId); setGrades(null); setStudentDraft(null); setGroupDraft(null); setLaboratory('')
     setShowStudentForm(false); setFirstName(''); setLastName('')
     studentsFailedRef.current = false; attendanceFailedRef.current = false
     setMessage('')
@@ -311,11 +360,22 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName, onS
       })
   }
 
+  const addLaboratory = () => {
+    if (!selected) return
+    const groupId = selected
+    void run(async () => {
+      const created = await createLaboratory(groupId)
+      setLaboratories((state) => state.groupId === groupId ? { ...state, items: [...state.items, created].sort((a, b) => a.number - b.number) } : state)
+      setLaboratory(created.label)
+      setMessage(`${created.label} a fost adăugat pentru această grupă.`)
+    }, 'Lucrarea nu a fost adăugată.')
+  }
+
   const submitGrade = (event: FormEvent, student: TeacherStudent) => {
     event.preventDefault()
     const score = Number(gradeValue.replace(',', '.'))
     if (gradeValue.trim() === '' || !Number.isFinite(score) || score < 0 || score > 10) return setMessage('Nota trebuie să fie un număr între 0 și 10.')
-    if (!laboratory.trim()) return setMessage('Completează denumirea laboratorului.')
+    if (!laboratory.trim()) return setMessage('Adaugă sau alege mai întâi o lucrare.')
     // The grade is stamped with the current date by the API; keep the displayed day in step with it.
     rolledOverDate()
     void run(async () => {
@@ -377,15 +437,17 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName, onS
       {!isSettings && <nav className="catalog-tabs" aria-label="Tip evidență">
         <button type="button" className={tab === 'attendance' ? 'active' : ''} aria-pressed={tab === 'attendance'} onClick={() => setTab('attendance')}>Prezență</button>
         <button type="button" className={tab === 'grades' ? 'active' : ''} aria-pressed={tab === 'grades'} onClick={() => setTab('grades')}>Note</button>
+        <button type="button" className={tab === 'statistics' ? 'active' : ''} aria-pressed={tab === 'statistics'} onClick={() => setTab('statistics')}>Statistici</button>
       </nav>}
       {!isSettings && tab === 'grades' && studentsReady && students.length > 0 && <form className="catalog-form" onSubmit={(e) => e.preventDefault()}>
-        <strong>Laborator</strong>
-        <input maxLength={LIMITS.laboratory} value={laboratory} onChange={(e) => setLaboratory(e.target.value)} placeholder="ex. Laborator 1" aria-label="Denumirea laboratorului" />
+        <strong>Lucrare</strong>
+        <div className="form-row"><select value={laboratory} onChange={(e) => setLaboratory(e.target.value)} aria-label="Lucrarea selectată" disabled={laboratoriesLoading || laboratories.failed || busy}><option value="">{laboratoriesLoading ? 'Se încarcă…' : 'Alege lucrarea'}</option>{laboratories.items.map((item) => <option key={item.id} value={item.label}>{item.label}</option>)}</select><button type="button" onClick={addLaboratory} disabled={busy || laboratoriesLoading}>＋ Adaugă lucrare</button></div>
+        {laboratories.failed && <button type="button" onClick={() => setTab('attendance')}>Reîncearcă după reselectarea filei Note</button>}
       </form>}
       {message && <p className="catalog-message" role="status">{message}</p>}
       {!isSettings && tab === 'attendance' && attendance.groupId === selected && attendance.failed && studentsReady && students.length > 0 &&
         <button type="button" className="catalog-retry" onClick={reloadAttendance}>Reîncearcă încărcarea prezenței</button>}
-      <div className="student-list">
+      {!isSettings && tab === 'statistics' ? <StatisticsPanel item={statistics.groupId === selected ? statistics.item : null} loading={statisticsLoading} failed={statistics.groupId === selected && statistics.failed} retry={() => { setStatistics({ groupId: '', item: null, loading: false, failed: false }); setTab('attendance'); window.setTimeout(() => setTab('statistics'), 0) }} /> : <div className="student-list">
         {isSettings && available && <>
           {!showStudentForm && <button type="button" className="add-student" disabled={!selected} onClick={() => setShowStudentForm(true)}>＋ Adaugă student</button>}
           {showStudentForm && <form className="catalog-form" onSubmit={addStudent} onFocus={revealSubmit}>
@@ -438,7 +500,7 @@ export function TeacherCatalog({ mode, available, onClose, initialGroupName, onS
           <span aria-hidden="true">👥</span><strong>{emptyTitle}</strong><p>{emptyText}</p>
           {studentsReady && studentsState.failed && <button type="button" className="catalog-retry" onClick={reloadStudents}>Reîncearcă</button>}
         </div>}
-      </div>
+      </div>}
     </section>
   </div>
 }

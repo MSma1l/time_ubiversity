@@ -81,6 +81,8 @@ export const gradeSchema = z.object({
   laboratory: text(1, 120), grade: z.number().min(0).max(10),
   presentedOn: catalogDateSchema.optional(), feedback: optionalText(500)
 });
+/** The next laboratory number is assigned atomically by the server. */
+export const laboratorySchema = z.object({}).strict();
 
 /**
  * GET /api/non-working-days?from=…&to=… — a closed interval, at most `MAX_RANGE_DAYS` long (a bit more
