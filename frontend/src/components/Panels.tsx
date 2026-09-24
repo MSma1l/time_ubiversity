@@ -59,12 +59,15 @@ type CalendarProps = {
   /** University clock: lessons of the displayed week are marked past / current. */
   clock: UniversityClock,
   onShiftWeek(delta: number): void, onResetWeek(): void, onClose(): void, onAdd(day: number, time: string): void, onEdit(lesson: Lesson): void,
+  onMove(lesson: Lesson, day: number, time: string): void, onPaste(lesson: Lesson, day: number, time: string): void,
 }
 
-export function CalendarPanel({ lessons, role, clock, weekStart, weekOffset, onShiftWeek, onResetWeek, onClose, onAdd, onEdit }: CalendarProps) {
+export function CalendarPanel({ lessons, role, clock, weekStart, weekOffset, onShiftWeek, onResetWeek, onClose, onAdd, onEdit, onMove, onPaste }: CalendarProps) {
   const dialogRef = useDialog<HTMLElement>(onClose)
   /** Off: only the displayed week's lessons. On: every lesson of the role; the other parity is dimmed but still editable. */
   const [showAll, setShowAll] = useState(false)
+  const [dragged, setDragged] = useState<Lesson | null>(null)
+  const [copied, setCopied] = useState<Lesson | null>(null)
   const week = weekTypeFor(weekStart)
   const roleLessons = lessons.filter((lesson) => lesson.role === role)
   /** When odd and even lessons share a slot, both stay visible as the cell's top/bottom halves. */
@@ -92,6 +95,16 @@ export function CalendarPanel({ lessons, role, clock, weekStart, weekOffset, onS
     cells.set(key, [...(cells.get(key) ?? []), lesson].sort(order))
   }
   const roleName = roleLabels[role]
+  const dropLesson = (event: React.DragEvent<HTMLElement>, day: number, time: string) => {
+    event.preventDefault()
+    const lesson = dragged
+    setDragged(null)
+    if (lesson && (lesson.weekday !== day || lesson.startTime !== time)) onMove(lesson, day, time)
+  }
+  const dragOver = (event: React.DragEvent<HTMLElement>) => {
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+  }
 
   return <div className="modal-backdrop calendar-backdrop" role="presentation">
     <section ref={dialogRef} className="calendar-panel" role="dialog" aria-modal="true" aria-labelledby="calendar-title" tabIndex={-1}>
@@ -101,7 +114,8 @@ export function CalendarPanel({ lessons, role, clock, weekStart, weekOffset, onS
       </div>
       <div className="calendar-toolbar"><WeekNav start={weekStart} offset={weekOffset} onShift={onShiftWeek} onReset={onResetWeek} /></div>
       <div className="calendar-hint-row">
-        <p className="calendar-hint">Orarul de {roleName}. {showAll ? `Orele doar din săptămâna ${weekTypeLabels[week === 'even' ? 'odd' : 'even']} sunt estompate și pot fi editate.` : 'Doar orele din această săptămână.'}</p>
+        <p className="calendar-hint">{copied ? <><b>Copiat: {copied.title}.</b> Alege o celulă liberă cu ⧉ pentru lipire sau renunță.</> : <>Orarul de {roleName}. Trage o oră pentru mutare. {showAll ? `Orele doar din săptămâna ${weekTypeLabels[week === 'even' ? 'odd' : 'even']} sunt estompate și pot fi editate.` : 'Doar orele din această săptămână.'}</>}</p>
+        {copied && <button type="button" className="calendar-cancel-copy" onClick={() => setCopied(null)}>Renunță</button>}
         <button type="button" className={`calendar-toggle ${showAll ? 'on' : ''}`} aria-pressed={showAll} onClick={() => setShowAll((value) => !value)}>
           Toate orele{!showAll && hiddenCount > 0 ? ` (+${hiddenCount})` : ''}
         </button>
@@ -113,22 +127,25 @@ export function CalendarPanel({ lessons, role, clock, weekStart, weekOffset, onS
           <div className="time-label" key={`${time}-label`}>{time}</div>,
           ...days.map((dayName, day) => {
             const items = cells.get(`${day}-${slot}`) ?? []
-            if (!items.length) return <button type="button" className="calendar-cell" key={`${day}-${time}`} onClick={() => onAdd(day, time)} aria-label={`Adaugă o oră ${dayName} la ${time}`}><span aria-hidden="true">+</span></button>
+            if (!items.length) return <button type="button" className={`calendar-cell${dragged ? ' drop-target' : ''}`} key={`${day}-${time}`} onDragOver={dragOver} onDrop={(event) => dropLesson(event, day, time)} onClick={() => copied ? onPaste(copied, day, time) : onAdd(day, time)} aria-label={copied ? `Lipește ${copied.title} ${dayName} la ${time}` : `Adaugă o oră ${dayName} la ${time}`}><span aria-hidden="true">{copied ? '⧉' : '+'}</span></button>
             // A parity-specific class always reserves its own half: odd above, even below.
             // This keeps its position stable even when the counterpart is not shown this week.
             const parityLayout = items.some((item) => item.weekType !== 'both')
-            return <div className={`calendar-cell occupied${parityLayout ? ' parity-layout' : ''}`} key={`${day}-${time}`}>
+            return <div className={`calendar-cell occupied${parityLayout ? ' parity-layout' : ''}${dragged ? ' drop-target' : ''}`} key={`${day}-${time}`} onDragOver={dragOver} onDrop={(event) => dropLesson(event, day, time)}>
               {items.map((item) => {
                 const inWeek = lessonMatchesWeek(item, week)
                 // Only lessons that take place in the displayed week have a time state.
                 const timing = inWeek ? lessonTiming(item, addDays(weekStart, day), clock) : undefined
                 const state = timing?.state === 'past' || timing?.state === 'current' ? timing.state : ''
                 const spoken = state ? `, ${timingText(timing)?.spoken}` : ''
-                return <button type="button" key={item.id} className={['calendar-lesson', item.weekType === 'odd' ? 'odd-slot' : item.weekType === 'even' ? 'even-slot' : '', inWeek ? '' : 'other-week', state].filter(Boolean).join(' ')} onClick={() => onEdit(item)}
-                  aria-label={`Editează ${item.title}, ${dayName} ${item.startTime}, ${shortWeek[item.weekType]}${inWeek ? '' : ' (nu în această săptămână)'}${spoken}`}>
+                const description = `${item.title}, ${dayName} ${item.startTime}, ${shortWeek[item.weekType]}${inWeek ? '' : ' (nu în această săptămână)'}${spoken}`
+                return <div key={item.id} className={['calendar-lesson', item.weekType === 'odd' ? 'odd-slot' : item.weekType === 'even' ? 'even-slot' : '', inWeek ? '' : 'other-week', state].filter(Boolean).join(' ')}>
                   {state === 'past' && <CheckIcon />}{state === 'current' && <i className="live-dot" aria-hidden="true" />}
-                  <b>{item.title}</b><small>{item.startTime !== time ? `${item.startTime} · ` : ''}{item.room}</small><em>{shortWeek[item.weekType]}</em>
-                </button>
+                  <button type="button" className="calendar-lesson-edit" draggable onDragStart={(event) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', item.id); setDragged(item) }} onDragEnd={() => setDragged(null)} onClick={() => onEdit(item)} aria-label={`Editează ${description}`}>
+                    <b>{item.title}</b><small>{item.startTime !== time ? `${item.startTime} · ` : ''}{item.room}</small><em>{shortWeek[item.weekType]}</em>
+                  </button>
+                  <button type="button" className="calendar-lesson-copy" onClick={() => setCopied(item)} aria-label={`Copiază ${description}`}>⧉</button>
+                </div>
               })}
             </div>
           }),

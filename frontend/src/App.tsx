@@ -6,7 +6,7 @@ import { CalendarPanel, NotificationPanel, ProfilePanel, WeekNav } from './compo
 import { TeacherCatalog } from './components/TeacherCatalog'
 import { minutesLabel, roleLabels } from './labels'
 import profileAvatar from './assets/profile-avatar.svg'
-import { activeSemesters, addDays, byStartTime, currentInstant, dayOfMonth, demoLessons, formatDayMonth, formatWeekRange, installSemesters, isStudyDay, lessonMatchesWeek, lessonTiming, mondayOf, semesterAnchorOf, timeToMinutes, universityClock, weekdayNames, weekTypeFor, weekTypeLabels } from './schedule'
+import { activeSemesters, addDays, byStartTime, currentInstant, dayOfMonth, demoLessons, formatDayMonth, formatWeekRange, installSemesters, isStudyDay, lessonMatchesWeek, lessonTiming, minutesToTime, mondayOf, semesterAnchorOf, timeToMinutes, universityClock, weekdayNames, weekTypeFor, weekTypeLabels } from './schedule'
 import { confirmAction, detectSession } from './telegram'
 import type { AccountProfile } from './api'
 import type { Semester } from './schedule'
@@ -96,6 +96,8 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   const [catalogGroupNames, setCatalogGroupNames] = useState<string[]>([])
   /** Catalog groups may have changed (teacher lesson saved, catalog edited): re-fetch them before they are needed again. */
   const catalogGroupsStaleRef = useRef(true)
+  /** Unique local ids for copied lessons in demo mode; the API assigns real ids in production. */
+  const copiedLessonSequenceRef = useRef(0)
   const lastDateRef = useRef(today.isoDate)
   /** Profile PATCH requests are serialised: a second tap while one is pending is ignored. */
   const profileBusyRef = useRef(false)
@@ -305,6 +307,16 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
   }
   const openNewLesson = (day = activeDay, time = '08:00') => openEditor({ lesson: null, slot: { day: Math.min(day, weekdayNames.length - 1), time }, role })
   const openLesson = (lesson: Lesson) => openEditor({ lesson, slot: null, role: lesson.role })
+  const atCalendarSlot = (lesson: Lesson, day: number, startTime: string) => {
+    const duration = Math.max(5, timeToMinutes(lesson.endTime) - timeToMinutes(lesson.startTime))
+    return { ...lesson, weekday: day, startTime, endTime: minutesToTime(timeToMinutes(startTime) + duration) }
+  }
+  const moveLesson = (lesson: Lesson, day: number, startTime: string) => { void saveLesson(atCalendarSlot(lesson, day, startTime), false) }
+  const pasteLesson = (lesson: Lesson, day: number, startTime: string) => {
+    const copy = atCalendarSlot(lesson, day, startTime)
+    copiedLessonSequenceRef.current += 1
+    void saveLesson({ ...copy, id: `local-copy-${lesson.id}-${day}-${startTime}-${copiedLessonSequenceRef.current}` }, true)
+  }
   const openGroupStudents = (group: string) => { setCatalogGroup(group); setGroupSettingsOpen(true) }
   const closeCatalog = () => { catalogGroupsStaleRef.current = true; setCatalogOpen(false); setGroupSettingsOpen(false); setCatalogGroup(null) }
   const groupSuggestions = useMemo(() => {
@@ -539,7 +551,7 @@ function Schedule({ initialName, demo }: { initialName: string, demo: boolean })
     </footer>
 
     {calendarOpen && <CalendarPanel lessons={lessons} role={role} clock={today} weekStart={weekStart} weekOffset={weekOffset} onShiftWeek={shiftWeek} onResetWeek={() => setWeekOffset(0)}
-      onClose={() => setCalendarOpen(false)} onAdd={openNewLesson} onEdit={(lesson) => { setCalendarOpen(false); openLesson(lesson) }} />}
+      onClose={() => setCalendarOpen(false)} onAdd={openNewLesson} onEdit={(lesson) => { setCalendarOpen(false); openLesson(lesson) }} onMove={moveLesson} onPaste={pasteLesson} />}
     {editor && <LessonEditor key={editor.lesson?.id ?? 'new'} role={editor.role} existing={editor.lesson} slot={editor.slot} onClose={() => setEditor(null)}
       groupSuggestions={editor.role === 'teacher' ? groupSuggestions : undefined} onSave={(lesson) => saveLesson(lesson, !editor.lesson)} onDelete={editor.lesson ? () => removeLesson(editor.lesson as Lesson) : undefined} />}
     {notificationsOpen && <NotificationPanel items={roleNotifications} error={notice?.kind === 'error' ? notice.text : ''} onClose={() => setNotificationsOpen(false)} />}
